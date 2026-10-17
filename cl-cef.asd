@@ -19,4 +19,5 @@
   :components ((:module "source"
                 :components
                 (
-                 (:file "package"))))
+                 (:file "package")
+                 (:file "library" :depends-on ("package")))))
