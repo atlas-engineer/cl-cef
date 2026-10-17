@@ -1543,6 +1543,9 @@ void cl_cef_view_set_bar_height(int id, int height) {
   CallUI([record]() {
     if (!record->widget)
       return;
+    // A preferred height of 0 is an empty size, and the box layout then keeps
+    // the view's own size. Hiding the view drops it from the layout.
+    record->widget->SetVisible(record->bar_height > 0);
     record->widget->InvalidateLayout();
     if (auto window = record->widget->GetWindow())
       window->Layout();
@@ -1565,6 +1568,8 @@ void cl_cef_view_set_bounds(int id, int x, int y, int width, int height) {
   CallUI([record, x, y, width, height]() {
     if (!record || !record->widget)
       return;
+    if (record->bar)
+      record->widget->SetVisible(height > 0);
     if (auto window = record->widget->GetWindow()) {
       if (window->GetLayout()) {
         record->widget->InvalidateLayout();
