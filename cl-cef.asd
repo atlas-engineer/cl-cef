@@ -22,4 +22,5 @@
                  (:file "package")
                  (:file "library" :depends-on ("package"))
                  (:file "core" :depends-on ("package" "library"))
-                 (:file "protocol" :depends-on ("package" "core")))))
+                 (:file "protocol" :depends-on ("package" "core"))
+                 (:file "view" :depends-on ("package" "core")))))
