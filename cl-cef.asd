@@ -25,4 +25,5 @@
                  (:file "protocol" :depends-on ("package" "core"))
                  (:file "view" :depends-on ("package" "core"))
                  (:file "window" :depends-on ("package" "core" "view"))
-                 (:file "web-contents" :depends-on ("package" "core" "view")))))
+                 (:file "web-contents" :depends-on ("package" "core" "view"))
+                 (:file "session" :depends-on ("package" "core")))))
