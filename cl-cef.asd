@@ -20,4 +20,5 @@
                 :components
                 (
                  (:file "package")
-                 (:file "library" :depends-on ("package")))))
+                 (:file "library" :depends-on ("package"))
+                 (:file "core" :depends-on ("package" "library")))))
