@@ -18,8 +18,7 @@
                uiop)
   :components ((:module "source"
                 :components
-                (
-                 (:file "package")
+                ((:file "package")
                  (:file "library" :depends-on ("package"))
                  (:file "core" :depends-on ("package" "library"))
                  (:file "protocol" :depends-on ("package" "core"))
@@ -27,3 +26,13 @@
                  (:file "window" :depends-on ("package" "core" "view"))
                  (:file "web-contents" :depends-on ("package" "core" "view"))
                  (:file "session" :depends-on ("package" "core")))))
+  :in-order-to ((test-op (test-op "cl-cef/tests"))))
+
+(defsystem "cl-cef/tests"
+  :pathname "tests"
+  :depends-on (cl-cef lisp-unit2)
+  :components ((:file "tests"))
+  :perform (test-op (op c)
+             (declare (ignore op c))
+             (uiop:symbol-call :lisp-unit2 :run-tests
+                               :package :cef/tests)))
