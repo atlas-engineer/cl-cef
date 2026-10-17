@@ -1,0 +1,2010 @@
+/*
+ * SPDX-FileCopyrightText: Atlas Engineer LLC
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * In-process CEF bridge. One UI thread runs CefRunMessageLoop. Every other
+ * thread posts work onto it. Object ids are the handles Lisp holds.
+ */
+
+#include "cl-cef.h"
+#include "schemes.hh"
+
+#include "include/cef_app.h"
+#include "include/cef_browser.h"
+#include "include/cef_client.h"
+#include "include/cef_parser.h"
+#include "include/base/cef_build.h"
+#include "include/views/cef_box_layout.h"
+#include "include/views/cef_browser_view.h"
+#include "include/views/cef_browser_view_delegate.h"
+#include "include/views/cef_window.h"
+#include "include/views/cef_window_delegate.h"
+#include "include/wrapper/cef_helpers.h"
+#include "include/wrapper/cef_message_router.h"
+
+#include <algorithm>
+#include <atomic>
+#if defined(__x86_64__)
+#include <cstdint>
+#endif
+#include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+struct cl_cef_response {
+  std::string data;
+  std::string mime = "text/html";
+  int status = 200;
+  std::string status_text = "OK";
+  std::string headers;
+};
+
+namespace {
+
+struct UserScript {
+  int id = 0;
+  std::string code;
+  bool at_start = false;
+  bool all_frames = true;
+};
+
+struct JsWaiter {
+  bool done = false;
+  bool success = false;
+  std::string json = "null";
+  std::mutex mu;
+  std::condition_variable cv;
+};
+
+class DevToolsObserver : public CefDevToolsMessageObserver {
+ public:
+  void Expect(int id, std::shared_ptr<JsWaiter> waiter) {
+    std::lock_guard<std::mutex> lock(mu_);
+    waiters_[id] = std::move(waiter);
+  }
+
+  void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,
+                              int message_id,
+                              bool success,
+                              const void* result,
+                              size_t result_size) override {
+    (void)browser;
+    std::shared_ptr<JsWaiter> waiter;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto found = waiters_.find(message_id);
+      if (found == waiters_.end())
+        return;
+      waiter = found->second;
+      waiters_.erase(found);
+    }
+    std::string json = "null";
+    bool ok = success && Decode(result, result_size, json);
+    {
+      std::lock_guard<std::mutex> lock(waiter->mu);
+      waiter->done = true;
+      waiter->success = ok;
+      waiter->json = std::move(json);
+    }
+    waiter->cv.notify_one();
+  }
+
+ private:
+  static bool Decode(const void* result, size_t result_size, std::string& json) {
+    if (!result || result_size == 0)
+      return false;
+    std::string text(static_cast<const char*>(result), result_size);
+    CefRefPtr<CefValue> root = CefParseJSON(text, JSON_PARSER_RFC);
+    if (!root || root->GetType() != VTYPE_DICTIONARY)
+      return false;
+    CefRefPtr<CefDictionaryValue> dict = root->GetDictionary();
+    if (!dict || dict->HasKey("exceptionDetails"))
+      return false;
+    if (!dict->HasKey("result") || dict->GetType("result") != VTYPE_DICTIONARY)
+      return false;
+    CefRefPtr<CefDictionaryValue> body = dict->GetDictionary("result");
+    if (!body)
+      return false;
+    if (body->HasKey("value")) {
+      CefString written = CefWriteJSON(body->GetValue("value"), JSON_WRITER_DEFAULT);
+      json = written.ToString();
+      if (json.empty())
+        json = "null";
+      return true;
+    }
+    json = "null";
+    return body->GetString("type") == "undefined";
+  }
+
+  std::mutex mu_;
+  std::unordered_map<int, std::shared_ptr<JsWaiter>> waiters_;
+  IMPLEMENT_REFCOUNTING(DevToolsObserver);
+};
+
+struct ViewRecord {
+  int id = 0;
+  CefRefPtr<CefBrowserView> widget;
+  CefRefPtr<CefBrowser> browser;
+  CefRefPtr<CefRequestContext> context;
+  CefRefPtr<DevToolsObserver> devtools_observer;
+  CefRefPtr<CefRegistration> devtools_registration;
+  std::vector<std::function<void(CefRefPtr<CefBrowser>)>> pending;
+  std::string title;
+  std::string user_agent;
+  std::string proxy;
+  bool focused = false;
+  bool javascript = true;
+  bool images = true;
+  bool webgl = true;
+  bool muted = false;
+  int x = 0;
+  int y = 0;
+  int width = 0;
+  int height = 0;
+  // A bar view keeps this height. The page view stays flexible and fills
+  // whatever the bars do not use. Browser views otherwise prefer a window-sized
+  // rectangle, which is why the status text (sized in vh) became huge.
+  bool bar = false;
+  int bar_height = 0;
+  bool flex_set = false;
+  int cookie_policy = 0;
+  int next_script_id = 1;
+  int next_css_id = 1;
+  int devtools_message_id = 0;
+  std::vector<UserScript> scripts;
+  std::unordered_map<std::string, std::string> css;
+};
+
+struct WindowRecord {
+  int id = 0;
+  CefRefPtr<CefWindow> window;
+  CefRefPtr<CefWindowDelegate> delegate;
+  CefRefPtr<CefBoxLayout> layout;
+  int width = 1600;
+  int height = 1200;
+  std::string title;
+};
+
+std::mutex g_mu;
+int g_next_id = 1;
+std::unordered_map<int, std::shared_ptr<ViewRecord>> g_views;
+std::unordered_map<int, std::shared_ptr<WindowRecord>> g_windows;
+std::unordered_map<int, int> g_browser_to_view;
+std::unordered_map<uint32_t, CefRefPtr<CefDownloadItemCallback>> g_download_callbacks;
+std::string g_download_directory;
+CefRefPtr<CefMenuModel> g_menu;
+std::atomic<cl_cef_event_callback> g_event_cb{nullptr};
+std::atomic<cl_cef_scheme_callback> g_scheme_cb{nullptr};
+std::atomic<bool> g_initialized{false};
+
+// Scheme handlers run on CEF's IO thread, which is not a Lisp thread.
+// Requests are handed to a Lisp thread and waited on.
+struct SchemeJob {
+  std::string scheme;
+  std::string url;
+  cl_cef_response response;
+  std::promise<void> done;
+};
+
+std::mutex g_scheme_mu;
+std::condition_variable g_scheme_cv;
+std::queue<std::shared_ptr<SchemeJob>> g_scheme_queue;
+std::atomic<bool> g_scheme_stop{false};
+std::vector<std::string> g_args;
+std::vector<char*> g_argv;
+
+void MaskFpTraps();
+
+class ClosureTask : public CefTask {
+ public:
+  explicit ClosureTask(std::function<void()> fn) : fn_(std::move(fn)) {}
+  void Execute() override {
+    MaskFpTraps();
+    fn_();
+  }
+
+ private:
+  std::function<void()> fn_;
+  IMPLEMENT_REFCOUNTING(ClosureTask);
+};
+
+// SBCL leaves the invalid, overflow, and divide-by-zero traps unmasked for the
+// whole process. Chromium threads inherit that and a later floating-point
+// operation (the prompt's layout hit one) is delivered as SIGFPE to Lisp.
+void MaskFpTraps() {
+#if defined(__x86_64__)
+  unsigned int mxcsr = 0;
+  asm volatile("stmxcsr %0" : "=m"(mxcsr));
+  mxcsr |= 0x3fu << 7;
+  asm volatile("ldmxcsr %0" ::"m"(mxcsr));
+  unsigned short control = 0;
+  asm volatile("fnstcw %0" : "=m"(control));
+  control = static_cast<unsigned short>(control | 0x3fu);
+  asm volatile("fldcw %0" ::"m"(control));
+#else
+#endif
+}
+
+void PostUI(std::function<void()> fn) {
+  if (CefCurrentlyOn(TID_UI)) {
+    MaskFpTraps();
+    fn();
+  } else {
+    CefPostTask(TID_UI, new ClosureTask(std::move(fn)));
+  }
+}
+
+template <typename F>
+auto CallUI(F&& fn) -> decltype(fn()) {
+  using R = decltype(fn());
+  if (CefCurrentlyOn(TID_UI)) {
+    MaskFpTraps();
+    return fn();
+  }
+  auto promise = std::make_shared<std::promise<R>>();
+  CefPostTask(TID_UI, new ClosureTask([promise, fn = std::function<R()>(std::forward<F>(fn))]() {
+                try {
+                  if constexpr (std::is_void_v<R>) {
+                    fn();
+                    promise->set_value();
+                  } else {
+                    promise->set_value(fn());
+                  }
+                } catch (...) {
+                  promise->set_exception(std::current_exception());
+                }
+              }));
+  return promise->get_future().get();
+}
+
+char* Dup(const std::string& text) {
+  char* copy = static_cast<char*>(std::malloc(text.size() + 1));
+  if (!copy)
+    return nullptr;
+  std::memcpy(copy, text.data(), text.size() + 1);
+  return copy;
+}
+
+std::string JsonEscape(const std::string& text) {
+  std::string out;
+  out.reserve(text.size() + 8);
+  for (unsigned char character : text) {
+    switch (character) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (character < 0x20) {
+          char buffer[8];
+          std::snprintf(buffer, sizeof buffer, "\\u%04x", character);
+          out += buffer;
+        } else {
+          out += static_cast<char>(character);
+        }
+    }
+  }
+  return out;
+}
+
+std::string JsonString(const std::string& text) {
+  return "\"" + JsonEscape(text) + "\"";
+}
+
+int Emit(int object_id, const std::string& json) {
+  cl_cef_event_callback callback = g_event_cb.load();
+  if (!callback)
+    return 0;
+  return callback(object_id, json.c_str());
+}
+
+std::shared_ptr<ViewRecord> FindView(int id) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto found = g_views.find(id);
+  return found == g_views.end() ? nullptr : found->second;
+}
+
+std::shared_ptr<WindowRecord> FindWindow(int id) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto found = g_windows.find(id);
+  return found == g_windows.end() ? nullptr : found->second;
+}
+
+int AllocateId() {
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_next_id++;
+}
+
+void WithBrowser(const std::shared_ptr<ViewRecord>& view,
+                 const std::function<void(CefRefPtr<CefBrowser>)>& fn) {
+  if (!view)
+    return;
+  if (view->browser)
+    fn(view->browser);
+  else
+    view->pending.push_back(fn);
+}
+
+std::string Base64(const std::string& input) {
+  static const char table[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((input.size() + 2) / 3) * 4);
+  unsigned value = 0;
+  int bits = -6;
+  for (unsigned char character : input) {
+    value = (value << 8) + character;
+    bits += 8;
+    while (bits >= 0) {
+      out.push_back(table[(value >> bits) & 0x3f]);
+      bits -= 6;
+    }
+  }
+  if (bits > -6)
+    out.push_back(table[((value << 8) >> (bits + 8)) & 0x3f]);
+  while (out.size() % 4)
+    out.push_back('=');
+  return out;
+}
+
+double FactorToLevel(double factor) {
+  if (!(factor > 0.0))
+    return 0.0;
+  return std::log(factor) / std::log(1.2);
+}
+
+double LevelToFactor(double level) {
+  return std::pow(1.2, level);
+}
+
+void ApplyCss(CefRefPtr<CefFrame> frame, const std::string& key, const std::string& css) {
+  if (!frame)
+    return;
+  std::string script =
+      "(()=>{var id=" + JsonString(key) +
+      ";var node=document.getElementById(id);"
+      "if(!node){node=document.createElement('style');node.id=id;"
+      "(document.head||document.documentElement).appendChild(node);}"
+      "node.textContent=" + JsonString(css) + ";})()";
+  frame->ExecuteJavaScript(script, frame->GetURL(), 0);
+}
+
+void ApplyScripts(const std::shared_ptr<ViewRecord>& view,
+                  CefRefPtr<CefFrame> frame,
+                  bool at_start) {
+  if (!view || !frame)
+    return;
+  for (const auto& script : view->scripts) {
+    if (script.at_start != at_start)
+      continue;
+    if (!script.all_frames && !frame->IsMain())
+      continue;
+    frame->ExecuteJavaScript(script.code, frame->GetURL(), 0);
+  }
+  if (at_start && frame->IsMain()) {
+    for (const auto& entry : view->css)
+      ApplyCss(frame, entry.first, entry.second);
+  }
+}
+
+void SetBoolPreference(CefRefPtr<CefRequestContext> context,
+                       const char* name,
+                       bool enabled) {
+  if (!context)
+    return;
+  CefRefPtr<CefValue> value = CefValue::Create();
+  value->SetBool(enabled);
+  CefString error;
+  context->SetPreference(name, value, error);
+}
+
+void SetProxyPreference(CefRefPtr<CefRequestContext> context,
+                        const std::string& server,
+                        const std::string& bypass) {
+  if (!context)
+    return;
+  CefRefPtr<CefDictionaryValue> proxy = CefDictionaryValue::Create();
+  if (server.empty()) {
+    proxy->SetString("mode", "direct");
+  } else {
+    proxy->SetString("mode", "fixed_servers");
+    proxy->SetString("server", server);
+    if (!bypass.empty())
+      proxy->SetString("bypass_list", bypass);
+  }
+  CefRefPtr<CefValue> value = CefValue::Create();
+  value->SetDictionary(proxy);
+  CefString error;
+  context->SetPreference("proxy", value, error);
+}
+
+void SetCookiePreference(CefRefPtr<CefRequestContext> context, int policy) {
+  if (!context)
+    return;
+  // Replacing the whole dictionary drops the other content settings. Chromium
+  // then reads those missing entries as strings and faults.
+  CefRefPtr<CefValue> existing =
+      context->GetPreference("profile.default_content_setting_values");
+  CefRefPtr<CefDictionaryValue> content;
+  if (existing && existing->GetType() == VTYPE_DICTIONARY && existing->GetDictionary())
+    content = existing->GetDictionary()->Copy(false);
+  else
+    content = CefDictionaryValue::Create();
+  // Content setting 1 is allow, 2 is block. Third-party blocking is separate.
+  content->SetInt("cookies", policy == 1 ? 2 : 1);
+  CefRefPtr<CefValue> content_value = CefValue::Create();
+  content_value->SetDictionary(content);
+  CefString error;
+  context->SetPreference("profile.default_content_setting_values", content_value, error);
+  CefRefPtr<CefValue> third_party = CefValue::Create();
+  third_party->SetBool(policy == 2);
+  context->SetPreference("profile.block_third_party_cookies", third_party, error);
+}
+
+class SchemeHandler : public CefResourceHandler {
+ public:
+  explicit SchemeHandler(std::string scheme) : scheme_(std::move(scheme)) {}
+
+  bool Open(CefRefPtr<CefRequest> request,
+            bool& handle_request,
+            CefRefPtr<CefCallback> callback) override {
+    (void)callback;
+    handle_request = true;
+    if (!request || !g_scheme_cb.load())
+      return true;
+    auto job = std::make_shared<SchemeJob>();
+    job->scheme = scheme_;
+    job->url = request->GetURL().ToString();
+    {
+      std::lock_guard<std::mutex> lock(g_scheme_mu);
+      if (g_scheme_stop.load())
+        return true;
+      g_scheme_queue.push(job);
+    }
+    g_scheme_cv.notify_one();
+    job->done.get_future().wait();
+    data_ = std::move(job->response.data);
+    mime_ = job->response.mime.empty() ? "text/html" : job->response.mime;
+    status_ = job->response.status > 0 ? job->response.status : 200;
+    status_text_ = job->response.status_text.empty() ? "OK" : job->response.status_text;
+    headers_ = job->response.headers;
+    return true;
+  }
+
+  void GetResponseHeaders(CefRefPtr<CefResponse> response,
+                          int64_t& response_length,
+                          CefString& redirect_url) override {
+    (void)redirect_url;
+    if (response) {
+      response->SetStatus(status_);
+      response->SetStatusText(status_text_);
+      // SetMimeType rejects parameters. "text/html;charset=utf-8" is not HTML
+      // to Chromium, so the tags are drawn as text.
+      std::string mime = mime_;
+      std::string charset;
+      std::size_t semi = mime.find(';');
+      if (semi != std::string::npos) {
+        std::string params = mime.substr(semi + 1);
+        mime.resize(semi);
+        const std::string key = "charset=";
+        std::size_t at = params.find(key);
+        if (at != std::string::npos) {
+          charset = params.substr(at + key.size());
+          std::size_t end = charset.find_first_of(" ;");
+          if (end != std::string::npos)
+            charset.resize(end);
+        }
+      }
+      while (!mime.empty() && mime.back() == ' ')
+        mime.pop_back();
+      response->SetMimeType(mime.empty() ? "text/html" : mime);
+      if (charset.empty() && (mime.rfind("text/", 0) == 0 || mime == "application/javascript" ||
+                              mime == "application/json"))
+        charset = "utf-8";
+      if (!charset.empty())
+        response->SetCharset(charset);
+      std::size_t start = 0;
+      while (start < headers_.size()) {
+        std::size_t end = headers_.find('\n', start);
+        if (end == std::string::npos)
+          end = headers_.size();
+        std::string line = headers_.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r')
+          line.pop_back();
+        std::size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+          std::string name = line.substr(0, colon);
+          std::string value = line.substr(colon + 1);
+          if (!value.empty() && value.front() == ' ')
+            value.erase(value.begin());
+          response->SetHeaderByName(name, value, true);
+        }
+        start = end + 1;
+      }
+    }
+    response_length = static_cast<int64_t>(data_.size());
+  }
+
+  bool Read(void* data_out,
+            int bytes_to_read,
+            int& bytes_read,
+            CefRefPtr<CefResourceReadCallback> callback) override {
+    (void)callback;
+    if (offset_ >= data_.size()) {
+      bytes_read = 0;
+      return false;
+    }
+    std::size_t remaining = data_.size() - offset_;
+    std::size_t count = static_cast<std::size_t>(bytes_to_read) < remaining
+                            ? static_cast<std::size_t>(bytes_to_read)
+                            : remaining;
+    std::memcpy(data_out, data_.data() + offset_, count);
+    offset_ += count;
+    bytes_read = static_cast<int>(count);
+    return true;
+  }
+
+  void Cancel() override {}
+
+ private:
+  std::string scheme_;
+  std::string data_;
+  std::string mime_;
+  std::string status_text_;
+  std::string headers_;
+  int status_ = 200;
+  std::size_t offset_ = 0;
+  IMPLEMENT_REFCOUNTING(SchemeHandler);
+};
+
+class SchemeFactory : public CefSchemeHandlerFactory {
+ public:
+  explicit SchemeFactory(std::string scheme) : scheme_(std::move(scheme)) {}
+
+  CefRefPtr<CefResourceHandler> Create(CefRefPtr<CefBrowser> browser,
+                                       CefRefPtr<CefFrame> frame,
+                                       const CefString& scheme_name,
+                                       CefRefPtr<CefRequest> request) override {
+    (void)browser;
+    (void)frame;
+    (void)scheme_name;
+    (void)request;
+    return new SchemeHandler(scheme_);
+  }
+
+ private:
+  std::string scheme_;
+  IMPLEMENT_REFCOUNTING(SchemeFactory);
+};
+
+class QueryHandler : public CefMessageRouterBrowserSide::Handler {
+ public:
+  explicit QueryHandler(int view_id) : view_id_(view_id) {}
+
+  bool OnQuery(CefRefPtr<CefBrowser> browser,
+               CefRefPtr<CefFrame> frame,
+               int64_t query_id,
+               const CefString& request,
+               bool persistent,
+               CefRefPtr<Callback> callback) override {
+    (void)browser;
+    (void)frame;
+    (void)query_id;
+    (void)persistent;
+    Handle(request.ToString());
+    if (callback)
+      callback->Success("");
+    return true;
+  }
+
+ private:
+  static bool Flag(CefRefPtr<CefDictionaryValue> dict, const char* key) {
+    return dict && dict->HasKey(key) && dict->GetBool(key);
+  }
+
+  static double Number(CefRefPtr<CefDictionaryValue> dict, const char* key) {
+    if (!dict || !dict->HasKey(key))
+      return 0;
+    if (dict->GetType(key) == VTYPE_INT)
+      return dict->GetInt(key);
+    if (dict->GetType(key) == VTYPE_DOUBLE)
+      return dict->GetDouble(key);
+    return 0;
+  }
+
+  void Handle(const std::string& request) {
+    CefRefPtr<CefValue> root = CefParseJSON(request, JSON_PARSER_RFC);
+    if (!root || root->GetType() != VTYPE_DICTIONARY)
+      return;
+    CefRefPtr<CefDictionaryValue> dict = root->GetDictionary();
+    std::string kind = dict->GetString("kind").ToString();
+    std::string mods =
+        std::string(",\"shift\":") + (Flag(dict, "shift") ? "true" : "false") +
+        ",\"control\":" + (Flag(dict, "control") ? "true" : "false") +
+        ",\"alt\":" + (Flag(dict, "alt") ? "true" : "false") +
+        ",\"meta\":" + (Flag(dict, "meta") ? "true" : "false") + "}";
+    if (kind == "button") {
+      int button = dict->GetInt("button") + 1;
+      Emit(view_id_,
+           "{\"event\":\"button-press\",\"button\":" + std::to_string(button) + mods);
+    } else if (kind == "wheel") {
+      double dx = Number(dict, "dx");
+      double dy = Number(dict, "dy");
+      int button = 0;
+      if (dy > 0)
+        button = 5;
+      else if (dy < 0)
+        button = 4;
+      else if (dx > 0)
+        button = 7;
+      else if (dx < 0)
+        button = 6;
+      if (button)
+        Emit(view_id_,
+             "{\"event\":\"scroll\",\"button\":" + std::to_string(button) + mods);
+    } else if (kind == "hover") {
+      Emit(view_id_,
+           "{\"event\":\"hover\",\"url\":" + JsonString(dict->GetString("url").ToString()) + "}");
+    }
+  }
+
+  int view_id_;
+};
+
+class Client : public CefClient,
+               public CefLifeSpanHandler,
+               public CefLoadHandler,
+               public CefDisplayHandler,
+               public CefKeyboardHandler,
+               public CefRequestHandler,
+               public CefResourceRequestHandler,
+               public CefDownloadHandler,
+               public CefContextMenuHandler,
+               public CefFocusHandler {
+ public:
+  explicit Client(int view_id)
+      : view_id_(view_id),
+        router_(CefMessageRouterBrowserSide::Create(CefMessageRouterConfig())),
+        queries_(new QueryHandler(view_id)) {
+    if (router_)
+      router_->AddHandler(queries_.get(), false);
+  }
+
+  CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+  CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
+  CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+  CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
+  CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+  CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
+  CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
+  CefRefPtr<CefFocusHandler> GetFocusHandler() override { return this; }
+
+  bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
+                                CefRefPtr<CefFrame> frame,
+                                CefProcessId source_process,
+                                CefRefPtr<CefProcessMessage> message) override {
+    return router_ && router_->OnProcessMessageReceived(browser, frame, source_process, message);
+  }
+
+  void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+    auto view = FindView(view_id_);
+    if (!view || !browser)
+      return;
+    view->browser = browser;
+    g_browser_to_view[browser->GetIdentifier()] = view_id_;
+    auto pending = std::move(view->pending);
+    view->pending.clear();
+    // These run while the view is being attached. Calling them inline re-enters
+    // AddChildView (a queued LoadURL is the usual case) and the message loop
+    // never returns.
+    for (const auto& fn : pending)
+      CefPostTask(TID_UI, new ClosureTask([fn, browser]() { fn(browser); }));
+  }
+
+  bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
+                     CefRefPtr<CefFrame> frame,
+                     int popup_id,
+                     const CefString& target_url,
+                     const CefString& target_frame_name,
+                     CefLifeSpanHandler::WindowOpenDisposition target_disposition,
+                     bool user_gesture,
+                     const CefPopupFeatures& popup_features,
+                     CefWindowInfo& window_info,
+                     CefRefPtr<CefClient>& client,
+                     CefBrowserSettings& settings,
+                     CefRefPtr<CefDictionaryValue>& extra_info,
+                     bool* no_javascript_access) override {
+    (void)browser;
+    (void)frame;
+    (void)popup_id;
+    (void)target_frame_name;
+    (void)target_disposition;
+    (void)user_gesture;
+    (void)popup_features;
+    (void)window_info;
+    (void)client;
+    (void)settings;
+    (void)extra_info;
+    (void)no_javascript_access;
+    int consumed = Emit(view_id_,
+                        "{\"event\":\"window-open\",\"url\":" +
+                            JsonString(target_url.ToString()) + "}");
+    return consumed != 0;
+  }
+
+  void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    if (router_) {
+      router_->RemoveHandler(queries_.get());
+      router_->OnBeforeClose(browser);
+    }
+    auto view = FindView(view_id_);
+    if (view)
+      view->browser = nullptr;
+    if (browser)
+      g_browser_to_view.erase(browser->GetIdentifier());
+    Emit(view_id_, "{\"event\":\"closed\"}");
+  }
+
+  void OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
+                            bool is_loading,
+                            bool can_go_back,
+                            bool can_go_forward) override {
+    (void)browser;
+    (void)can_go_back;
+    (void)can_go_forward;
+    (void)is_loading;
+  }
+
+  void OnLoadStart(CefRefPtr<CefBrowser> browser,
+                   CefRefPtr<CefFrame> frame,
+                   TransitionType transition_type) override {
+    (void)browser;
+    (void)transition_type;
+    if (!frame)
+      return;
+    auto view = FindView(view_id_);
+    ApplyScripts(view, frame, true);
+    if (!frame->IsMain())
+      return;
+    Emit(view_id_,
+         "{\"event\":\"did-start-loading\",\"url\":" + JsonString(frame->GetURL().ToString()) + "}");
+  }
+
+  void OnLoadEnd(CefRefPtr<CefBrowser> browser,
+                 CefRefPtr<CefFrame> frame,
+                 int http_status_code) override {
+    (void)browser;
+    (void)http_status_code;
+    if (!frame)
+      return;
+    auto view = FindView(view_id_);
+    ApplyScripts(view, frame, false);
+    if (!frame->IsMain())
+      return;
+    Emit(view_id_,
+         "{\"event\":\"did-finish-load\",\"url\":" + JsonString(frame->GetURL().ToString()) + "}");
+  }
+
+  void OnLoadError(CefRefPtr<CefBrowser> browser,
+                   CefRefPtr<CefFrame> frame,
+                   ErrorCode error_code,
+                   const CefString& error_text,
+                   const CefString& failed_url) override {
+    (void)browser;
+    if (!frame || !frame->IsMain())
+      return;
+    Emit(view_id_,
+         "{\"event\":\"did-fail-load\",\"url\":" + JsonString(failed_url.ToString()) +
+             ",\"errorCode\":" + std::to_string(static_cast<int>(error_code)) +
+             ",\"errorText\":" + JsonString(error_text.ToString()) + "}");
+  }
+
+  void OnAddressChange(CefRefPtr<CefBrowser> browser,
+                       CefRefPtr<CefFrame> frame,
+                       const CefString& url) override {
+    (void)browser;
+    if (!frame || !frame->IsMain())
+      return;
+    Emit(view_id_, "{\"event\":\"address-change\",\"url\":" + JsonString(url.ToString()) + "}");
+  }
+
+  void OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString& title) override {
+    (void)browser;
+    auto view = FindView(view_id_);
+    if (view)
+      view->title = title.ToString();
+    Emit(view_id_, "{\"event\":\"page-title-updated\",\"title\":" + JsonString(title.ToString()) + "}");
+  }
+
+  void OnFullscreenModeChange(CefRefPtr<CefBrowser> browser, bool fullscreen) override {
+    (void)browser;
+    Emit(view_id_,
+         std::string("{\"event\":\"fullscreen\",\"fullscreen\":") +
+             (fullscreen ? "true}" : "false}"));
+  }
+
+  bool OnPreKeyEvent(CefRefPtr<CefBrowser> browser,
+                     const CefKeyEvent& event,
+                     CefEventHandle os_event,
+                     bool* is_keyboard_shortcut) override {
+    (void)browser;
+    (void)os_event;
+    (void)is_keyboard_shortcut;
+    if (event.type != KEYEVENT_RAWKEYDOWN && event.type != KEYEVENT_KEYUP)
+      return false;
+    const char* type = event.type == KEYEVENT_KEYUP ? "keyUp" : "keyDown";
+    std::string character;
+    if (event.character >= 32 && event.character < 127)
+      character.assign(1, static_cast<char>(event.character));
+    int consumed = Emit(
+        view_id_,
+        std::string("{\"event\":\"before-input-event\",\"type\":") + JsonString(type) +
+            ",\"windowsKeyCode\":" + std::to_string(event.windows_key_code) +
+            ",\"modifiers\":" + std::to_string(event.modifiers) +
+            ",\"character\":" + JsonString(character) +
+            ",\"shift\":" + ((event.modifiers & EVENTFLAG_SHIFT_DOWN) ? "true" : "false") +
+            ",\"control\":" + ((event.modifiers & EVENTFLAG_CONTROL_DOWN) ? "true" : "false") +
+            ",\"alt\":" + ((event.modifiers & EVENTFLAG_ALT_DOWN) ? "true" : "false") +
+            ",\"meta\":" + ((event.modifiers & EVENTFLAG_COMMAND_DOWN) ? "true" : "false") + "}");
+    return consumed != 0;
+  }
+
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser,
+                      CefRefPtr<CefFrame> frame,
+                      CefRefPtr<CefRequest> request,
+                      bool user_gesture,
+                      bool is_redirect) override {
+    (void)request;
+    (void)user_gesture;
+    if (router_)
+      router_->OnBeforeBrowse(browser, frame);
+    if (is_redirect && frame && frame->IsMain() && request)
+      Emit(view_id_,
+           "{\"event\":\"did-redirect-navigation\",\"url\":" +
+               JsonString(request->GetURL().ToString()) + "}");
+    return false;
+  }
+
+  CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
+      CefRefPtr<CefBrowser> browser,
+      CefRefPtr<CefFrame> frame,
+      CefRefPtr<CefRequest> request,
+      bool is_navigation,
+      bool is_download,
+      const CefString& request_initiator,
+      bool& disable_default_handling) override {
+    (void)browser;
+    (void)frame;
+    (void)request;
+    (void)is_navigation;
+    (void)is_download;
+    (void)request_initiator;
+    (void)disable_default_handling;
+    return this;
+  }
+
+  void OnResourceRedirect(CefRefPtr<CefBrowser> browser,
+                          CefRefPtr<CefFrame> frame,
+                          CefRefPtr<CefRequest> request,
+                          CefRefPtr<CefResponse> response,
+                          CefString& new_url) override {
+    (void)browser;
+    (void)request;
+    (void)response;
+    if (!frame || !frame->IsMain())
+      return;
+    Emit(view_id_,
+         "{\"event\":\"did-redirect-navigation\",\"url\":" + JsonString(new_url.ToString()) + "}");
+  }
+
+  bool CanDownload(CefRefPtr<CefBrowser> browser,
+                   const CefString& url,
+                   const CefString& request_method) override {
+    (void)browser;
+    (void)url;
+    (void)request_method;
+    return true;
+  }
+
+  bool OnBeforeDownload(CefRefPtr<CefBrowser> browser,
+                        CefRefPtr<CefDownloadItem> download_item,
+                        const CefString& suggested_name,
+                        CefRefPtr<CefBeforeDownloadCallback> callback) override {
+    (void)browser;
+    if (callback && download_item) {
+      std::string name = suggested_name.ToString();
+      for (char& character : name) {
+        if (character == '/' || character == '\\')
+          character = '_';
+      }
+      if (name.empty())
+        name = "download";
+      std::string directory = g_download_directory.empty() ? "/tmp" : g_download_directory;
+      callback->Continue(directory + "/" + name, false);
+    }
+    return true;
+  }
+
+  void OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
+                         CefRefPtr<CefDownloadItem> download_item,
+                         CefRefPtr<CefDownloadItemCallback> callback) override {
+    (void)browser;
+    if (!download_item)
+      return;
+    uint32_t id = download_item->GetId();
+    if (callback)
+      g_download_callbacks[id] = callback;
+    const char* state = "interrupted";
+    if (download_item->IsComplete())
+      state = "completed";
+    else if (download_item->IsCanceled())
+      state = "cancelled";
+    else if (download_item->IsInProgress())
+      state = "progressing";
+    int percent = download_item->GetPercentComplete();
+    if (percent < 0)
+      percent = download_item->IsComplete() ? 100 : 0;
+    Emit(-1,
+         std::string("{\"event\":\"download-item-updated\",\"id\":") + std::to_string(id) +
+             ",\"url\":" + JsonString(download_item->GetURL().ToString()) +
+             ",\"state\":" + JsonString(state) +
+             ",\"receivedBytes\":" + std::to_string(download_item->GetReceivedBytes()) +
+             ",\"totalBytes\":" + std::to_string(download_item->GetTotalBytes()) +
+             ",\"percentComplete\":" + std::to_string(percent) +
+             ",\"savePath\":" + JsonString(download_item->GetFullPath().ToString()) + "}");
+  }
+
+  void OnBeforeContextMenu(CefRefPtr<CefBrowser> browser,
+                           CefRefPtr<CefFrame> frame,
+                           CefRefPtr<CefContextMenuParams> params,
+                           CefRefPtr<CefMenuModel> model) override {
+    (void)browser;
+    (void)frame;
+    (void)params;
+    if (!model)
+      return;
+    model->AddSeparator();
+    g_menu = model;
+    Emit(view_id_, "{\"event\":\"context-menu\"}");
+    g_menu = nullptr;
+  }
+
+  bool OnContextMenuCommand(CefRefPtr<CefBrowser> browser,
+                            CefRefPtr<CefFrame> frame,
+                            CefRefPtr<CefContextMenuParams> params,
+                            int command_id,
+                            EventFlags event_flags) override {
+    (void)browser;
+    (void)frame;
+    (void)params;
+    (void)event_flags;
+    if (command_id < MENU_ID_USER_FIRST)
+      return false;
+    Emit(view_id_,
+         "{\"event\":\"context-menu-command\",\"commandId\":" + std::to_string(command_id) + "}");
+    return true;
+  }
+
+  void OnTakeFocus(CefRefPtr<CefBrowser> browser, bool next) override {
+    (void)browser;
+    (void)next;
+    auto view = FindView(view_id_);
+    if (view)
+      view->focused = false;
+  }
+
+  void OnGotFocus(CefRefPtr<CefBrowser> browser) override {
+    (void)browser;
+    auto view = FindView(view_id_);
+    if (view)
+      view->focused = true;
+    Emit(view_id_, "{\"event\":\"focus\"}");
+  }
+
+ private:
+  int view_id_;
+  CefRefPtr<CefMessageRouterBrowserSide> router_;
+  std::unique_ptr<QueryHandler> queries_;
+  IMPLEMENT_REFCOUNTING(Client);
+};
+
+class BrowserViewDelegate : public CefBrowserViewDelegate {
+ public:
+  BrowserViewDelegate(cef_runtime_style_t style, int view_id)
+      : style_(style), view_id_(view_id) {}
+
+  // A Chrome window hosts one Chrome browser view. Further views (status,
+  // message, prompt) must be Alloy or CEF refuses to add them.
+  cef_runtime_style_t GetBrowserRuntimeStyle() override { return style_; }
+
+  CefSize GetPreferredSize(CefRefPtr<CefView> view) override { return BarSize(view); }
+
+  CefSize GetMinimumSize(CefRefPtr<CefView> view) override { return BarSize(view); }
+
+  CefSize GetMaximumSize(CefRefPtr<CefView> view) override {
+    (void)view;
+    auto record = FindView(view_id_);
+    if (!record || !record->bar)
+      return CefSize();
+    // Width may grow with the window. Height stays the bar height, so vh
+    // units in the status document resolve against that strip.
+    return CefSize(100000, record->bar_height);
+  }
+
+  int GetHeightForWidth(CefRefPtr<CefView> view, int width) override {
+    (void)view;
+    (void)width;
+    auto record = FindView(view_id_);
+    if (!record || !record->bar)
+      return 0;
+    return record->bar_height;
+  }
+
+ private:
+  CefSize BarSize(CefRefPtr<CefView> view) const {
+    (void)view;
+    auto record = FindView(view_id_);
+    if (!record || !record->bar)
+      return CefSize();
+    return CefSize(1, record->bar_height);
+  }
+
+  cef_runtime_style_t style_;
+  int view_id_;
+  IMPLEMENT_REFCOUNTING(BrowserViewDelegate);
+};
+
+class WindowDelegate : public CefWindowDelegate {
+ public:
+  WindowDelegate(int id, int width, int height) : id_(id), width_(width), height_(height) {}
+
+  // A Chrome-style window can host several Alloy browser views. An Alloy
+  // window cannot, and Nyxt needs one view each for the page, status bar,
+  // and message bar.
+  cef_runtime_style_t GetWindowRuntimeStyle() override {
+    return CEF_RUNTIME_STYLE_CHROME;
+  }
+
+  CefRect GetInitialBounds(CefRefPtr<CefWindow> window) override {
+    (void)window;
+    return CefRect(100, 100, width_, height_);
+  }
+
+  void OnWindowCreated(CefRefPtr<CefWindow> window) override {
+    if (window)
+      window->Show();
+  }
+
+  void OnWindowDestroyed(CefRefPtr<CefWindow> window) override {
+    (void)window;
+    Emit(id_, "{\"event\":\"close\"}");
+  }
+
+  void OnWindowBoundsChanged(CefRefPtr<CefWindow> window, const CefRect& new_bounds) override {
+    (void)window;
+    // SetBounds from a resize listener calls back into this method. A nested
+    // emit runs that listener again and overflows the UI thread.
+    if (auto record = FindWindow(id_)) {
+      record->width = new_bounds.width;
+      record->height = new_bounds.height;
+    }
+    if (emitting_bounds_)
+      return;
+    emitting_bounds_ = true;
+    Emit(id_,
+         std::string("{\"event\":\"resize\",\"x\":") + std::to_string(new_bounds.x) +
+             ",\"y\":" + std::to_string(new_bounds.y) +
+             ",\"width\":" + std::to_string(new_bounds.width) +
+             ",\"height\":" + std::to_string(new_bounds.height) + "}");
+    emitting_bounds_ = false;
+  }
+
+  bool CanClose(CefRefPtr<CefWindow> window) override {
+    (void)window;
+    return true;
+  }
+
+ private:
+  int id_;
+  int width_;
+  int height_;
+  bool emitting_bounds_ = false;
+  IMPLEMENT_REFCOUNTING(WindowDelegate);
+};
+
+class BrowserApp : public CefApp, public CefBrowserProcessHandler {
+ public:
+  void OnRegisterCustomSchemes(CefRawPtr<CefSchemeRegistrar> registrar) override {
+    cl_cef_register_schemes(registrar);
+  }
+
+  CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
+
+ private:
+  IMPLEMENT_REFCOUNTING(BrowserApp);
+};
+
+void RememberArgs(int argc, char** argv) {
+  g_args.clear();
+  g_args.reserve(static_cast<std::size_t>(argc));
+  for (int i = 0; i < argc; ++i)
+    g_args.emplace_back(argv && argv[i] ? argv[i] : "");
+  g_argv.clear();
+  g_argv.reserve(g_args.size());
+  for (std::string& argument : g_args)
+    g_argv.push_back(argument.data());
+}
+
+}  // namespace
+
+extern "C" {
+
+void cl_cef_response_set(cl_cef_response* response,
+                         const char* data,
+                         size_t size,
+                         const char* mime_type,
+                         int status,
+                         const char* status_text,
+                         const char* headers) {
+  if (!response)
+    return;
+  if (data && size)
+    response->data.assign(data, size);
+  else
+    response->data.clear();
+  response->mime = mime_type && *mime_type ? mime_type : "text/html";
+  response->status = status > 0 ? status : 200;
+  response->status_text = status_text && *status_text ? status_text : "OK";
+  response->headers = headers ? headers : "";
+}
+
+void cl_cef_set_event_callback(cl_cef_event_callback callback) { g_event_cb.store(callback); }
+
+void cl_cef_set_scheme_callback(cl_cef_scheme_callback callback) { g_scheme_cb.store(callback); }
+
+int cl_cef_scheme_pump(void) {
+  std::shared_ptr<SchemeJob> job;
+  {
+    std::unique_lock<std::mutex> lock(g_scheme_mu);
+    g_scheme_cv.wait(lock, [] { return g_scheme_stop.load() || !g_scheme_queue.empty(); });
+    if (g_scheme_queue.empty())
+      return 0;
+    job = std::move(g_scheme_queue.front());
+    g_scheme_queue.pop();
+  }
+  cl_cef_scheme_callback callback = g_scheme_cb.load();
+  if (callback && job)
+    callback(job->scheme.c_str(), job->url.c_str(), &job->response);
+  if (job)
+    job->done.set_value();
+  return 1;
+}
+
+void cl_cef_scheme_stop(void) {
+  std::lock_guard<std::mutex> lock(g_scheme_mu);
+  g_scheme_stop.store(true);
+  while (!g_scheme_queue.empty()) {
+    g_scheme_queue.front()->done.set_value();
+    g_scheme_queue.pop();
+  }
+  g_scheme_cv.notify_all();
+}
+
+int cl_cef_initialize(int argc,
+                      char** argv,
+                      const char* subprocess_path,
+                      const char* cache_path,
+                      const char* resources_dir_path,
+                      const char* locales_dir_path,
+                      const char* user_agent,
+                      const char* schemes,
+                      int no_sandbox,
+                      int remote_debugging_port) {
+#if defined(OS_WIN)
+  (void)argc;
+  (void)argv;
+  (void)subprocess_path;
+  (void)cache_path;
+  (void)resources_dir_path;
+  (void)locales_dir_path;
+  (void)user_agent;
+  (void)schemes;
+  (void)no_sandbox;
+  (void)remote_debugging_port;
+  return 0;
+#else
+  cl_cef_note_schemes(schemes);
+  cl_cef_note_schemes_from_argv(argc, argv);
+  MaskFpTraps();
+  cl_cef_write_scheme_file(cache_path);
+  RememberArgs(argc, argv);
+  CefMainArgs main_args(static_cast<int>(g_argv.size()), g_argv.data());
+  CefRefPtr<BrowserApp> app = new BrowserApp();
+  int subprocess = CefExecuteProcess(main_args, app, nullptr);
+  if (subprocess >= 0)
+    std::_Exit(subprocess);
+
+  CefSettings settings;
+  settings.no_sandbox = no_sandbox ? 1 : 0;
+  settings.windowless_rendering_enabled = 0;
+  settings.persist_session_cookies = 1;
+  settings.log_severity = LOGSEVERITY_WARNING;
+  if (remote_debugging_port > 0)
+    settings.remote_debugging_port = remote_debugging_port;
+  if (subprocess_path && *subprocess_path)
+    CefString(&settings.browser_subprocess_path) = subprocess_path;
+  if (cache_path && *cache_path) {
+    CefString(&settings.root_cache_path) = cache_path;
+    CefString(&settings.cache_path) = std::string(cache_path) + "/cache";
+  }
+  if (resources_dir_path && *resources_dir_path)
+    CefString(&settings.resources_dir_path) = resources_dir_path;
+  if (locales_dir_path && *locales_dir_path)
+    CefString(&settings.locales_dir_path) = locales_dir_path;
+  if (user_agent && *user_agent)
+    CefString(&settings.user_agent) = user_agent;
+  if (!CefInitialize(main_args, settings, app, nullptr))
+    return 0;
+  for (const auto& scheme : cl_cef_parse_schemes(schemes))
+    CefRegisterSchemeHandlerFactory(scheme.name, "", new SchemeFactory(scheme.name));
+  g_initialized.store(true);
+  return 1;
+#endif
+}
+
+void cl_cef_run_message_loop(cl_cef_ready_callback ready) {
+  MaskFpTraps();
+  if (!g_initialized.load())
+    return;
+  if (ready)
+    CefPostTask(TID_UI, new ClosureTask([ready]() { ready(); }));
+  CefRunMessageLoop();
+  std::fprintf(stderr, "cl-cef message loop returned\n");
+  std::fflush(stderr);
+}
+
+void cl_cef_quit_message_loop(void) {
+  std::fprintf(stderr, "cl-cef quit message loop\n");
+  std::fflush(stderr);
+  if (g_initialized.load())
+    CefQuitMessageLoop();
+}
+
+void cl_cef_post(cl_cef_task_callback callback) {
+  if (!callback || !g_initialized.load())
+    return;
+  // Always queue. An inline call re-enters CEF from the callback that posted
+  // the task, which is how resize listeners overflow the UI thread.
+  CefPostTask(TID_UI, new ClosureTask([callback]() { callback(); }));
+}
+
+void cl_cef_shutdown(void) {
+  if (!g_initialized.exchange(false))
+    return;
+  CefShutdown();
+}
+
+int cl_cef_on_ui_thread(void) { return CefCurrentlyOn(TID_UI) ? 1 : 0; }
+
+void cl_cef_string_free(char* string) { std::free(string); }
+
+void cl_cef_set_download_directory(const char* path) {
+  g_download_directory = path ? path : "";
+}
+
+int cl_cef_window_create(int width, int height, const char* title) {
+  int id = AllocateId();
+  auto record = std::make_shared<WindowRecord>();
+  record->id = id;
+  record->width = width > 0 ? width : 1600;
+  record->height = height > 0 ? height : 1200;
+  record->title = title ? title : "Nyxt";
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_windows[id] = record;
+  }
+  CallUI([&]() {
+    record->delegate = new WindowDelegate(id, record->width, record->height);
+    record->window = CefWindow::CreateTopLevelWindow(record->delegate);
+    if (record->window) {
+      // Vertical stack: the flexible page, then the fixed bars. Without this,
+      // a browser view's preferred size is the whole window and Chrome parks
+      // it at the top.
+      CefBoxLayoutSettings settings;
+      settings.horizontal = 0;
+      settings.between_child_spacing = 0;
+      settings.default_flex = 0;
+      settings.cross_axis_alignment = CEF_AXIS_ALIGNMENT_STRETCH;
+      record->layout = record->window->SetToBoxLayout(settings);
+      record->window->SetTitle(record->title);
+      record->window->Show();
+    }
+  });
+  if (!record->window) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_windows.erase(id);
+    return 0;
+  }
+  return id;
+}
+
+void cl_cef_window_close(int id) {
+  auto record = FindWindow(id);
+  CallUI([&]() {
+    if (record && record->window)
+      record->window->Close();
+  });
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_windows.erase(id);
+}
+
+void cl_cef_window_set_title(int id, const char* title) {
+  auto record = FindWindow(id);
+  CallUI([&]() {
+    if (record && record->window && title)
+      record->window->SetTitle(title);
+  });
+}
+
+char* cl_cef_window_get_title(int id) {
+  auto record = FindWindow(id);
+  std::string title = CallUI([&]() {
+    return record && record->window ? record->window->GetTitle().ToString() : std::string();
+  });
+  return Dup(title);
+}
+
+void cl_cef_window_fullscreen(int id, int on) {
+  auto record = FindWindow(id);
+  CallUI([&]() {
+    if (record && record->window)
+      record->window->SetFullscreen(on != 0);
+  });
+}
+
+void cl_cef_window_maximize(int id) {
+  auto record = FindWindow(id);
+  CallUI([&]() {
+    if (record && record->window)
+      record->window->Maximize();
+  });
+}
+
+void cl_cef_window_restore(int id) {
+  auto record = FindWindow(id);
+  CallUI([&]() {
+    if (record && record->window)
+      record->window->Restore();
+  });
+}
+
+void cl_cef_window_focus(int id) {
+  auto record = FindWindow(id);
+  CallUI([&]() {
+    if (!record || !record->window)
+      return;
+    record->window->Show();
+    record->window->Activate();
+    record->window->BringToTop();
+  });
+}
+
+int cl_cef_window_is_focused(int id) {
+  auto record = FindWindow(id);
+  return CallUI([&]() { return record && record->window && record->window->IsActive() ? 1 : 0; });
+}
+
+void cl_cef_window_bounds(int id, int* x, int* y, int* width, int* height) {
+  auto record = FindWindow(id);
+  CefRect bounds = CallUI([&]() {
+    return record && record->window ? record->window->GetBounds() : CefRect();
+  });
+  if (x) *x = bounds.x;
+  if (y) *y = bounds.y;
+  if (width) *width = bounds.width;
+  if (height) *height = bounds.height;
+}
+
+void cl_cef_window_content_bounds(int id, int* x, int* y, int* width, int* height) {
+  // GetClientAreaBoundsInScreen faults once a browser view has been added.
+  auto record = FindWindow(id);
+  if (x) *x = 0;
+  if (y) *y = 0;
+  if (width) *width = record ? record->width : 0;
+  if (height) *height = record ? record->height : 0;
+}
+
+void cl_cef_window_set_bounds(int id, int x, int y, int width, int height) {
+  auto record = FindWindow(id);
+  CallUI([&]() {
+    if (record && record->window)
+      record->window->SetBounds(CefRect(x, y, width, height));
+  });
+}
+
+void PlaceView(const std::shared_ptr<WindowRecord>& window,
+               const std::shared_ptr<ViewRecord>& view,
+               int index) {
+  if (!window || !window->window || !view || !view->widget)
+    return;
+  // Remove + Add on a view that is already parented registers its widget
+  // observer a second time. Chromium then aborts the UI thread.
+  CefRefPtr<CefView> parent = view->widget->GetParentView();
+  if (parent && !parent->IsSame(window->window)) {
+    if (auto panel = parent->AsPanel())
+      panel->RemoveChildView(view->widget);
+    parent = view->widget->GetParentView();
+  }
+  bool inserted = false;
+  if (!parent) {
+    if (index < 0)
+      window->window->AddChildView(view->widget);
+    else
+      window->window->AddChildViewAt(view->widget, index);
+    inserted = true;
+  } else if (index >= 0) {
+    window->window->ReorderChildView(view->widget, index);
+  }
+  if (window->layout && (inserted || !view->flex_set)) {
+    window->layout->SetFlexForView(view->widget, view->bar ? 0 : 1);
+    view->flex_set = true;
+  }
+  window->window->Layout();
+}
+
+void cl_cef_window_add_view(int window_id, int view_id) {
+  auto window = FindWindow(window_id);
+  auto view = FindView(view_id);
+  CallUI([window, view]() { PlaceView(window, view, -1); });
+}
+
+void cl_cef_window_add_view_at(int window_id, int view_id, int index) {
+  auto window = FindWindow(window_id);
+  auto view = FindView(view_id);
+  CallUI([window, view, index]() { PlaceView(window, view, index); });
+}
+
+void cl_cef_window_remove_view(int window_id, int view_id) {
+  auto window = FindWindow(window_id);
+  auto view = FindView(view_id);
+  CallUI([&]() {
+    if (window && window->window && view && view->widget)
+      window->window->RemoveChildView(view->widget);
+  });
+}
+
+int cl_cef_view_create(const char* url, int alloy) {
+  int id = AllocateId();
+  auto record = std::make_shared<ViewRecord>();
+  record->id = id;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_views[id] = record;
+  }
+  std::string initial = url && *url ? url : "about:blank";
+  cef_runtime_style_t style = alloy ? CEF_RUNTIME_STYLE_ALLOY : CEF_RUNTIME_STYLE_CHROME;
+  CallUI([record, initial, id, style]() {
+    CefRequestContextSettings context_settings;
+    record->context = CefRequestContext::CreateContext(context_settings, nullptr);
+    CefBrowserSettings browser_settings;
+    browser_settings.javascript = STATE_ENABLED;
+    browser_settings.image_loading = STATE_ENABLED;
+    browser_settings.webgl = STATE_ENABLED;
+    CefRefPtr<Client> client = new Client(id);
+    record->widget = CefBrowserView::CreateBrowserView(
+        client, initial, browser_settings, nullptr, nullptr,
+        new BrowserViewDelegate(style, id));
+  });
+  if (!record->widget) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_views.erase(id);
+    return 0;
+  }
+  return id;
+}
+
+void cl_cef_view_destroy(int id) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (!record)
+      return;
+    if (record->browser)
+      record->browser->GetHost()->CloseBrowser(true);
+    record->widget = nullptr;
+  });
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_views.erase(id);
+}
+
+void cl_cef_view_set_bar_height(int id, int height) {
+  auto record = FindView(id);
+  if (!record)
+    return;
+  record->bar = true;
+  record->bar_height = height > 0 ? height : 0;
+  record->height = record->bar_height;
+  CallUI([record]() {
+    if (!record->widget)
+      return;
+    record->widget->InvalidateLayout();
+    if (auto window = record->widget->GetWindow())
+      window->Layout();
+  });
+}
+
+void cl_cef_view_set_bounds(int id, int x, int y, int width, int height) {
+  auto record = FindView(id);
+  if (record) {
+    record->x = x;
+    record->y = y;
+    record->width = width;
+    record->height = height;
+    if (record->bar)
+      record->bar_height = height > 0 ? height : 0;
+  }
+  // CefView::GetBounds faults once the view is in a window. The box layout
+  // owns child rectangles; SetBounds on a bar expands it back to the
+  // browser's preferred size.
+  CallUI([record, x, y, width, height]() {
+    if (!record || !record->widget)
+      return;
+    if (auto window = record->widget->GetWindow()) {
+      if (window->GetLayout()) {
+        record->widget->InvalidateLayout();
+        window->Layout();
+        return;
+      }
+    }
+    record->widget->SetBounds(CefRect(x, y, width, height));
+  });
+}
+
+void cl_cef_view_get_bounds(int id, int* x, int* y, int* width, int* height) {
+  auto record = FindView(id);
+  if (x) *x = record ? record->x : 0;
+  if (y) *y = record ? record->y : 0;
+  if (width) *width = record ? record->width : 0;
+  if (height) *height = record ? record->height : 0;
+}
+
+void cl_cef_view_focus(int id) {
+  auto record = FindView(id);
+  CallUI([record]() {
+    if (record && record->widget)
+      record->widget->RequestFocus();
+  });
+}
+
+int cl_cef_view_is_focused(int id) {
+  auto record = FindView(id);
+  return CallUI([&]() { return record && record->focused ? 1 : 0; });
+}
+
+void cl_cef_view_load_url(int id, const char* url) {
+  auto record = FindView(id);
+  std::string target = url ? url : "";
+  // WithBrowser may run the callback after this function returns, so the
+  // callback owns its copy of the URL.
+  CallUI([record, target]() {
+    WithBrowser(record, [target](CefRefPtr<CefBrowser> browser) {
+      if (browser && browser->GetMainFrame())
+        browser->GetMainFrame()->LoadURL(target);
+    });
+  });
+}
+
+void cl_cef_view_load_html(int id, const char* html) {
+  auto record = FindView(id);
+  std::string target = std::string("data:text/html;base64,") + Base64(html ? html : "");
+  CallUI([record, target]() {
+    WithBrowser(record, [target](CefRefPtr<CefBrowser> browser) {
+      if (browser && browser->GetMainFrame())
+        browser->GetMainFrame()->LoadURL(target);
+    });
+  });
+}
+
+char* cl_cef_view_get_url(int id) {
+  auto record = FindView(id);
+  std::string url = CallUI([&]() {
+    if (record && record->browser && record->browser->GetMainFrame())
+      return record->browser->GetMainFrame()->GetURL().ToString();
+    return std::string();
+  });
+  return Dup(url);
+}
+
+char* cl_cef_view_get_title(int id) {
+  auto record = FindView(id);
+  std::string title = CallUI([&]() {
+    return record ? record->title : std::string();
+  });
+  return Dup(title);
+}
+
+void cl_cef_view_reload(int id) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (record && record->browser)
+      record->browser->Reload();
+  });
+}
+
+void cl_cef_view_stop(int id) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (record && record->browser)
+      record->browser->StopLoad();
+  });
+}
+
+void cl_cef_view_go_back(int id) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (record && record->browser && record->browser->CanGoBack())
+      record->browser->GoBack();
+  });
+}
+
+void cl_cef_view_go_forward(int id) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (record && record->browser && record->browser->CanGoForward())
+      record->browser->GoForward();
+  });
+}
+
+int cl_cef_view_can_go_back(int id) {
+  auto record = FindView(id);
+  return CallUI([&]() { return record && record->browser && record->browser->CanGoBack() ? 1 : 0; });
+}
+
+int cl_cef_view_can_go_forward(int id) {
+  auto record = FindView(id);
+  return CallUI(
+      [&]() { return record && record->browser && record->browser->CanGoForward() ? 1 : 0; });
+}
+
+void cl_cef_view_set_zoom_factor(int id, double factor) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (record && record->browser && factor > 0.0)
+      record->browser->GetHost()->SetZoomLevel(FactorToLevel(factor));
+  });
+}
+
+double cl_cef_view_get_zoom_factor(int id) {
+  auto record = FindView(id);
+  return CallUI([&]() {
+    if (!record || !record->browser)
+      return 1.0;
+    return LevelToFactor(record->browser->GetHost()->GetZoomLevel());
+  });
+}
+
+void cl_cef_view_set_audio_muted(int id, int muted) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (!record)
+      return;
+    record->muted = muted != 0;
+    if (record->browser)
+      record->browser->GetHost()->SetAudioMuted(record->muted);
+  });
+}
+
+int cl_cef_view_is_audio_muted(int id) {
+  auto record = FindView(id);
+  return CallUI([&]() {
+    if (!record)
+      return 0;
+    if (record->browser)
+      record->muted = record->browser->GetHost()->IsAudioMuted();
+    return record->muted ? 1 : 0;
+  });
+}
+
+void cl_cef_view_show_devtools(int id) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (!record || !record->browser)
+      return;
+    CefWindowInfo info;
+    CefBrowserSettings settings;
+    record->browser->GetHost()->ShowDevTools(info, nullptr, settings, CefPoint());
+  });
+}
+
+void cl_cef_view_close_devtools(int id) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (record && record->browser)
+      record->browser->GetHost()->CloseDevTools();
+  });
+}
+
+void Edit(int id, void (CefFrame::*method)()) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (record && record->browser && record->browser->GetFocusedFrame())
+      (record->browser->GetFocusedFrame().get()->*method)();
+  });
+}
+
+void cl_cef_view_undo(int id) { Edit(id, &CefFrame::Undo); }
+void cl_cef_view_redo(int id) { Edit(id, &CefFrame::Redo); }
+void cl_cef_view_cut(int id) { Edit(id, &CefFrame::Cut); }
+void cl_cef_view_copy(int id) { Edit(id, &CefFrame::Copy); }
+void cl_cef_view_paste(int id) { Edit(id, &CefFrame::Paste); }
+void cl_cef_view_select_all(int id) { Edit(id, &CefFrame::SelectAll); }
+
+void cl_cef_view_insert_text(int id, const char* text) {
+  auto record = FindView(id);
+  std::string script = "document.execCommand('insertText', false, " + JsonString(text ? text : "") + ");";
+  CallUI([record, script]() {
+    WithBrowser(record, [script](CefRefPtr<CefBrowser> browser) {
+      if (browser && browser->GetFocusedFrame())
+        browser->GetFocusedFrame()->ExecuteJavaScript(script, "", 0);
+    });
+  });
+}
+
+void cl_cef_view_execute_javascript(int id, const char* code) {
+  auto record = FindView(id);
+  std::string script = code ? code : "";
+  CallUI([record, script]() {
+    WithBrowser(record, [script](CefRefPtr<CefBrowser> browser) {
+      if (browser && browser->GetMainFrame())
+        browser->GetMainFrame()->ExecuteJavaScript(script, "", 0);
+    });
+  });
+}
+
+char* cl_cef_view_execute_javascript_sync(int id, const char* code, int* success) {
+  if (success)
+    *success = 0;
+  if (CefCurrentlyOn(TID_UI))
+    return nullptr;
+  auto record = FindView(id);
+  if (!record)
+    return nullptr;
+  auto waiter = std::make_shared<JsWaiter>();
+  int message_id = CallUI([&]() {
+    if (!record->browser)
+      return 0;
+    CefRefPtr<CefBrowserHost> host = record->browser->GetHost();
+    if (!record->devtools_observer) {
+      record->devtools_observer = new DevToolsObserver();
+      record->devtools_registration = host->AddDevToolsMessageObserver(record->devtools_observer);
+    }
+    CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+    params->SetString("expression", code ? code : "");
+    params->SetBool("returnByValue", true);
+    params->SetBool("awaitPromise", true);
+    int assigned = ++record->devtools_message_id;
+    record->devtools_observer->Expect(assigned, waiter);
+    host->ExecuteDevToolsMethod(assigned, "Runtime.evaluate", params);
+    return assigned;
+  });
+  if (message_id <= 0)
+    return nullptr;
+  {
+    std::unique_lock<std::mutex> lock(waiter->mu);
+    waiter->cv.wait_for(lock, std::chrono::seconds(30), [&]() { return waiter->done; });
+  }
+  if (success)
+    *success = waiter->success ? 1 : 0;
+  return waiter->success ? Dup(waiter->json) : nullptr;
+}
+
+char* cl_cef_view_insert_css(int id, const char* css) {
+  auto record = FindView(id);
+  if (!record || !css)
+    return nullptr;
+  std::string key = CallUI([record, css = std::string(css)]() {
+    std::string identifier = "cl-cef-css-" + std::to_string(record->next_css_id++);
+    record->css[identifier] = css;
+    WithBrowser(record, [identifier, css](CefRefPtr<CefBrowser> browser) {
+      if (browser)
+        ApplyCss(browser->GetMainFrame(), identifier, css);
+    });
+    return identifier;
+  });
+  return Dup(key);
+}
+
+void cl_cef_view_remove_inserted_css(int id, const char* key) {
+  auto record = FindView(id);
+  if (!record || !key)
+    return;
+  std::string identifier(key);
+  CallUI([record, identifier]() {
+    record->css.erase(identifier);
+    std::string script =
+        "(()=>{var node=document.getElementById(" + JsonString(identifier) +
+        ");if(node)node.remove();})()";
+    WithBrowser(record, [script](CefRefPtr<CefBrowser> browser) {
+      if (browser && browser->GetMainFrame())
+        browser->GetMainFrame()->ExecuteJavaScript(script, "", 0);
+    });
+  });
+}
+
+int cl_cef_view_add_user_script(int id, const char* code, int document_start, int all_frames) {
+  auto record = FindView(id);
+  if (!record || !code)
+    return 0;
+  return CallUI([&]() {
+    UserScript script;
+    script.id = record->next_script_id++;
+    script.code = code;
+    script.at_start = document_start != 0;
+    script.all_frames = all_frames != 0;
+    record->scripts.push_back(script);
+    if (!script.at_start) {
+      WithBrowser(record, [code = script.code](CefRefPtr<CefBrowser> browser) {
+        if (browser && browser->GetMainFrame())
+          browser->GetMainFrame()->ExecuteJavaScript(code, "", 0);
+      });
+    }
+    return script.id;
+  });
+}
+
+void cl_cef_view_remove_user_script(int id, int script_id) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (!record)
+      return;
+    auto& scripts = record->scripts;
+    scripts.erase(std::remove_if(scripts.begin(), scripts.end(),
+                                 [&](const UserScript& script) { return script.id == script_id; }),
+                  scripts.end());
+  });
+}
+
+void cl_cef_view_download_url(int id, const char* url) {
+  auto record = FindView(id);
+  std::string target = url ? url : "";
+  CallUI([&]() {
+    WithBrowser(record, [&](CefRefPtr<CefBrowser> browser) {
+      browser->GetHost()->StartDownload(target);
+    });
+  });
+}
+
+void cl_cef_view_set_javascript_enabled(int id, int enabled) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (!record)
+      return;
+    record->javascript = enabled != 0;
+    SetBoolPreference(record->context, "webkit.webprefs.javascript_enabled", record->javascript);
+  });
+}
+
+int cl_cef_view_javascript_enabled(int id) {
+  auto record = FindView(id);
+  return CallUI([&]() { return record && record->javascript ? 1 : 0; });
+}
+
+void cl_cef_view_set_images_enabled(int id, int enabled) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (!record)
+      return;
+    record->images = enabled != 0;
+    SetBoolPreference(record->context, "webkit.webprefs.loads_images_automatically", record->images);
+  });
+}
+
+int cl_cef_view_images_enabled(int id) {
+  auto record = FindView(id);
+  return CallUI([&]() { return record && record->images ? 1 : 0; });
+}
+
+void cl_cef_view_set_webgl_enabled(int id, int enabled) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (!record)
+      return;
+    record->webgl = enabled != 0;
+    SetBoolPreference(record->context, "webkit.webprefs.webgl_enabled", record->webgl);
+  });
+}
+
+int cl_cef_view_webgl_enabled(int id) {
+  auto record = FindView(id);
+  return CallUI([&]() { return record && record->webgl ? 1 : 0; });
+}
+
+void cl_cef_view_set_user_agent(int id, const char* user_agent) {
+  auto record = FindView(id);
+  std::string agent = user_agent ? user_agent : "";
+  CallUI([&]() {
+    if (!record)
+      return;
+    record->user_agent = agent;
+    WithBrowser(record, [&](CefRefPtr<CefBrowser> browser) {
+      CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+      params->SetString("userAgent", agent);
+      browser->GetHost()->ExecuteDevToolsMethod(0, "Network.setUserAgentOverride", params);
+    });
+  });
+}
+
+char* cl_cef_view_get_user_agent(int id) {
+  auto record = FindView(id);
+  std::string agent = CallUI([&]() { return record ? record->user_agent : std::string(); });
+  return Dup(agent);
+}
+
+void cl_cef_view_set_proxy(int id, const char* proxy_server, const char* bypass_list) {
+  auto record = FindView(id);
+  std::string server = proxy_server ? proxy_server : "";
+  std::string bypass = bypass_list ? bypass_list : "";
+  CallUI([&]() {
+    if (!record)
+      return;
+    record->proxy = server;
+    SetProxyPreference(record->context, server, bypass);
+  });
+}
+
+char* cl_cef_view_get_proxy(int id) {
+  auto record = FindView(id);
+  std::string proxy = CallUI([&]() { return record ? record->proxy : std::string(); });
+  return Dup(proxy);
+}
+
+void cl_cef_view_set_cookie_policy(int id, int policy) {
+  auto record = FindView(id);
+  CallUI([&]() {
+    if (!record)
+      return;
+    record->cookie_policy = policy;
+    SetCookiePreference(record->context, policy);
+  });
+}
+
+int cl_cef_view_cookie_policy(int id) {
+  auto record = FindView(id);
+  return CallUI([&]() { return record ? record->cookie_policy : 0; });
+}
+
+void cl_cef_download_cancel(unsigned int download_id) {
+  CallUI([&]() {
+    auto found = g_download_callbacks.find(download_id);
+    if (found != g_download_callbacks.end() && found->second)
+      found->second->Cancel();
+  });
+}
+
+void cl_cef_menu_add_separator(void) {
+  if (CefCurrentlyOn(TID_UI) && g_menu)
+    g_menu->AddSeparator();
+}
+
+void cl_cef_menu_add_item(int command_id, const char* label) {
+  if (CefCurrentlyOn(TID_UI) && g_menu && label)
+    g_menu->AddItem(command_id, label);
+}
+
+}  // extern "C"
