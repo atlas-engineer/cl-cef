@@ -163,6 +163,9 @@ struct ViewRecord {
   bool bar = false;
   int bar_height = 0;
   bool flex_set = false;
+  // Set while this view is being destroyed. DoClose uses it to close the
+  // browser without also closing the window that hosts the other views.
+  bool destroying = false;
   int cookie_policy = 0;
   int next_script_id = 1;
   int next_css_id = 1;
@@ -747,6 +750,14 @@ class Client : public CefClient,
                         "{\"event\":\"window-open\",\"url\":" +
                             JsonString(target_url.ToString()) + "}");
     return consumed != 0;
+  }
+
+  // Returning false asks CEF to close the top-level window. That removes the
+  // page from the UI and leaves the browser, and its audio, running.
+  bool DoClose(CefRefPtr<CefBrowser> browser) override {
+    (void)browser;
+    auto view = FindView(view_id_);
+    return view && view->destroying;
   }
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
@@ -1522,15 +1533,27 @@ int cl_cef_view_create(const char* url, int alloy) {
 
 void cl_cef_view_destroy(int id) {
   auto record = FindView(id);
-  CallUI([&]() {
-    if (!record)
-      return;
+  if (!record)
+    return;
+  // CefRefPtrs have to be released on the UI thread. Releasing them from the
+  // caller leaks the browser, so a deleted buffer keeps playing audio.
+  CallUI([record, id]() {
+    record->destroying = true;
+    if (record->browser)
+      record->browser->GetHost()->SetAudioMuted(true);
+    if (record->widget) {
+      if (CefRefPtr<CefView> parent = record->widget->GetParentView()) {
+        if (auto panel = parent->AsPanel())
+          panel->RemoveChildView(record->widget);
+      }
+    }
     if (record->browser)
       record->browser->GetHost()->CloseBrowser(true);
     record->widget = nullptr;
+    record->browser = nullptr;
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_views.erase(id);
   });
-  std::lock_guard<std::mutex> lock(g_mu);
-  g_views.erase(id);
 }
 
 void cl_cef_view_set_bar_height(int id, int height) {
