@@ -1,7 +1,7 @@
 ;;;; SPDX-FileCopyrightText: Atlas Engineer LLC
 ;;;; SPDX-License-Identifier: BSD-3-Clause
 
-;;;; CFFI bindings for the C bridge in src/cl-cef.h.
+;;;; CFFI bindings for the C bridge in source/cxx/cl-cef.h.
 ;;;; The shared library is loaded on `launch', not at system load time, so the
 ;;;; Lisp system compiles without a CEF binary distribution.
 

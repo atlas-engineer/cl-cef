@@ -16,7 +16,8 @@
                cl-json
                nclasses
                uiop)
-  :components ((:module "source"
+  :components ((:module "lisp"
+                :pathname "source/lisp"
                 :components
                 ((:file "package")
                  (:file "library" :depends-on ("package"))
