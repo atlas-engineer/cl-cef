@@ -194,6 +194,7 @@ std::string g_download_directory;
 CefRefPtr<CefMenuModel> g_menu;
 std::atomic<cl_cef_event_callback> g_event_cb{nullptr};
 std::atomic<cl_cef_scheme_callback> g_scheme_cb{nullptr};
+std::atomic<cl_cef_resource_callback> g_resource_cb{nullptr};
 std::atomic<bool> g_initialized{false};
 
 // Scheme handlers run on CEF's IO thread, which is not a Lisp thread.
@@ -911,6 +912,28 @@ class Client : public CefClient,
     return this;
   }
 
+  // Cancel here, on the IO thread, so a blocked script never starts. Returning
+  // false from DoClose is unrelated: that closes the top-level window.
+  ReturnValue OnBeforeResourceLoad(CefRefPtr<CefBrowser> browser,
+                                   CefRefPtr<CefFrame> frame,
+                                   CefRefPtr<CefRequest> request,
+                                   CefRefPtr<CefCallback> callback) override {
+    (void)callback;
+    cl_cef_resource_callback resource_callback = g_resource_cb.load();
+    if (!resource_callback || !request)
+      return RV_CONTINUE;
+    std::string url = request->GetURL().ToString();
+    std::string document;
+    if (frame)
+      document = frame->GetURL().ToString();
+    if (document.empty() && browser && browser->GetMainFrame())
+      document = browser->GetMainFrame()->GetURL().ToString();
+    if (resource_callback(url.c_str(), document.c_str(),
+                          static_cast<int>(request->GetResourceType())))
+      return RV_CANCEL;
+    return RV_CONTINUE;
+  }
+
   void OnResourceRedirect(CefRefPtr<CefBrowser> browser,
                           CefRefPtr<CefFrame> frame,
                           CefRefPtr<CefRequest> request,
@@ -1189,6 +1212,10 @@ void cl_cef_response_set(cl_cef_response* response,
 void cl_cef_set_event_callback(cl_cef_event_callback callback) { g_event_cb.store(callback); }
 
 void cl_cef_set_scheme_callback(cl_cef_scheme_callback callback) { g_scheme_cb.store(callback); }
+
+void cl_cef_set_resource_callback(cl_cef_resource_callback callback) {
+  g_resource_cb.store(callback);
+}
 
 int cl_cef_scheme_pump(void) {
   std::shared_ptr<SchemeJob> job;

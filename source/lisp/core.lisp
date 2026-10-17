@@ -230,6 +230,22 @@ write barrier, so that handler has to stay disabled."
       (warn "cl-cef event error: ~a" condition)
       0)))
 
+(export-always '*resource-callback*)
+(defvar *resource-callback* nil
+  "Function of URL, document URL, and a CEF resource-type integer.
+Return true to cancel the request. Called on CEF's IO thread.")
+
+(cffi:defcallback resource-callback :int
+    ((url :string) (document-url :string) (resource-type :int))
+  (handler-case
+      (if (and *resource-callback*
+               (funcall *resource-callback* url document-url resource-type))
+          1
+          0)
+    (error (condition)
+      (warn "cl-cef resource error: ~a" condition)
+      0)))
+
 (cffi:defcallback scheme-callback :void ((scheme :string) (url :string) (response :pointer))
   (handler-case (dispatch-scheme scheme url response)
     (error (condition)
@@ -428,6 +444,7 @@ CEF calls scheme handlers on its IO thread, which cannot enter Lisp.")
   (ensure-library (library-path interface))
   (cl-cef-set-event-callback (cffi:callback event-callback))
   (cl-cef-set-scheme-callback (cffi:callback scheme-callback))
+  (cl-cef-set-resource-callback (cffi:callback resource-callback))
   (setf *launch-error* nil)
   (setf *launch-ready* (bt:make-semaphore))
   (setf (slot-value interface 'ui-thread)

@@ -60,6 +60,9 @@
 (defcef "cl_cef_set_scheme_callback" :void
   (callback :pointer))
 
+(defcef "cl_cef_set_resource_callback" :void
+  (callback :pointer))
+
 (defcef "cl_cef_scheme_pump" :int)
 
 (defcef "cl_cef_scheme_stop" :void)

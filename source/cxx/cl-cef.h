@@ -37,6 +37,14 @@ typedef void (*cl_cef_scheme_callback)(const char* scheme,
  */
 typedef int (*cl_cef_event_callback)(int object_id, const char* json);
 
+/*
+ * Return 1 to cancel the request. RESOURCE_TYPE is cef_resource_type_t.
+ * Runs on CEF's IO thread and must not call back into CEF.
+ */
+typedef int (*cl_cef_resource_callback)(const char* url,
+                                        const char* document_url,
+                                        int resource_type);
+
 typedef void (*cl_cef_ready_callback)(void);
 typedef void (*cl_cef_task_callback)(void);
 
@@ -51,6 +59,7 @@ void cl_cef_response_set(cl_cef_response* response,
 
 void cl_cef_set_event_callback(cl_cef_event_callback callback);
 void cl_cef_set_scheme_callback(cl_cef_scheme_callback callback);
+void cl_cef_set_resource_callback(cl_cef_resource_callback callback);
 
 /* Blocks until one scheme request has been handled, then returns 1.
  * Returns 0 after cl_cef_scheme_stop. Call from a Lisp thread. */
