@@ -36,3 +36,8 @@
              (declare (ignore op c))
              (uiop:symbol-call :lisp-unit2 :run-tests
                                :package :cef/tests)))
+
+(defsystem "cl-cef/examples"
+  :pathname "examples"
+  :depends-on (cl-cef)
+  :components ((:file "example-window")))
