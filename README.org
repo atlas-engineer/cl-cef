@@ -1,0 +1,54 @@
+#+TITLE: cl-cef
+
+cl-cef is a Common Lisp interface to the [[https://bitbucket.org/chromiumembedded/cef][Chromium Embedded Framework]]. The Lisp API follows [[https://github.com/atlas-engineer/cl-electron][cl-electron]]: an =interface= owns the browser process, and =window=, =view=, and =web-contents= are objects addressed by an integer id.
+
+CEF's API is C++. Common Lisp foreign calls are C, so the library is split in two:
+
+- =source/cxx/= is a C ABI (=source/cxx/cl-cef.h=) implemented on top of CEF's Views framework. CMake builds it as =libcl-cef.so=, plus the =cl-cef-helper= subprocess.
+- =source/lisp/= binds that ABI with CFFI and is the =cl-cef= system. The package is =cef= (nickname =cl-cef=). The shared library is loaded from =launch=, not when the system is compiled, so the Lisp can be built without a CEF distribution.
+
+* Process model
+
+CEF runs inside the Lisp process. =launch= starts a thread named =cl-cef ui thread=, and that thread calls =CefInitialize= and then =CefRunMessageLoop=. It is the only thread that may call CEF directly. Other threads post work onto it with =within-ui-thread= (wait for the result) or =post-ui= (return immediately). =join= waits until that thread exits. =terminate= asks the message loop to quit; the UI thread then shuts CEF down.
+
+CEF also starts its own subprocesses. The browser process points them at =cl-cef-helper=, which lives next to =libcl-cef.so= and the CEF resource files. =CefExecuteProcess= in the helper returns a non-negative status for those processes and they must exit there.
+
+On startup the bridge turns off Chromium's crash reporter. SBCL uses =SIGSEGV= as a write barrier, and it leaves floating-point traps unmasked for the whole process. Chromium threads inherit those traps, so the bridge masks the invalid, overflow, and divide-by-zero exceptions before =CefInitialize= and on each task that runs on the UI thread.
+
+* Objects and events
+
+Each native window and view is stored in the bridge under an integer id. Lisp keeps the matching object in a table, and looks the object up when an event arrives. A =view= and its =web-contents= share one id. =web-contents= is where page operations live (navigation, JavaScript, zoom, editing, content settings); the same operations are available on =view=.
+
+Events cross the bridge as a JSON object. =add-listener= registers a callback for one object and one event name. The callback is =(lambda (object data) ...)=, where =data= is an alist. A non-nil return value consumes a synchronous event such as =:before-input-event= or =:window-open=. Callbacks run on the CEF UI thread and must return without waiting on that thread.
+
+* Custom schemes
+
+Scheme names and their privilege bits are fixed before =CefInitialize=. Chromium does not forward a custom environment variable or an unknown command-line switch into the network process, but it does forward =--user-data-dir=. =launch= writes the scheme list to =cl-cef-schemes= in that directory, and every process, including the helper, registers the schemes from that file. Set =protocols= on the interface before =launch=. Handlers may be attached afterwards with =handle-callback=.
+
+A handler runs on CEF's IO thread, which is not a Lisp thread. The bridge queues the request and a dedicated Lisp thread, started after =CefInitialize=, answers it. The callback receives the URL and returns the body, a MIME type, a status code, response headers, and a reason phrase. A MIME type such as =text/html;charset=utf-8= is split: CEF's =SetMimeType= rejects parameters, so the type and the charset are set separately.
+
+* Building
+
+CEF 124 or newer is required. =CEF_ROOT= is a binary distribution, the directory that contains =include/=, =Release/=, and =cmake/=.
+
+#+begin_src sh
+cmake -S . -B build -DCEF_ROOT=/path/to/cef_binary
+cmake --build build
+#+end_src
+
+The build writes =libcl-cef.so= and =cl-cef-helper= into =build/=, and copies the CEF resources next to them. Both binaries use =$ORIGIN= as their RPATH.
+
+* A window
+
+#+begin_src lisp
+(asdf:load-system :cl-cef/examples)
+(cef::example-window)
+#+end_src
+
+That creates an =interface=, calls =launch=, opens one window, and adds a view of =https://nyxt-browser.com=. On Wayland, CEF's Wayland backend faults when Vulkan is the GL implementation, so the example appends =--ozone-platform=x11= and uses XWayland. Closing the window does not quit the message loop; =terminate= does.
+
+* Copying
+
+cl-cef is distributed under the BSD 3-Clause license. See [[file:LICENSE][LICENSE]].
+
+That license covers this binding. The CEF binary distribution and Chromium are covered by their own terms.
