@@ -31,13 +31,13 @@ if(NOT TARGET libcef_lib)
 endif()
 
 set(CL_CEF_SOURCES
-  src/cl-cef.cc
-  src/cl-cef.h
-  src/schemes.hh)
+  source/cxx/cl-cef.cc
+  source/cxx/cl-cef.h
+  source/cxx/schemes.hh)
 
 add_library(cl-cef SHARED ${CL_CEF_SOURCES})
 target_compile_features(cl-cef PRIVATE cxx_std_20)
-target_include_directories(cl-cef PRIVATE "${CEF_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(cl-cef PRIVATE "${CEF_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}/source/cxx")
 add_dependencies(cl-cef libcef_dll_wrapper)
 target_link_libraries(cl-cef PRIVATE libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
 set_target_properties(cl-cef PROPERTIES
@@ -45,9 +45,9 @@ set_target_properties(cl-cef PROPERTIES
   INSTALL_RPATH "$ORIGIN"
   OUTPUT_NAME "cl-cef")
 
-add_executable(cl-cef-helper src/helper.cc src/schemes.hh)
+add_executable(cl-cef-helper source/cxx/helper.cc source/cxx/schemes.hh)
 target_compile_features(cl-cef-helper PRIVATE cxx_std_20)
-target_include_directories(cl-cef-helper PRIVATE "${CEF_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(cl-cef-helper PRIVATE "${CEF_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}/source/cxx")
 add_dependencies(cl-cef-helper libcef_dll_wrapper)
 target_link_libraries(cl-cef-helper PRIVATE libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
 set_target_properties(cl-cef-helper PROPERTIES
