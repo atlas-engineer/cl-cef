@@ -64,6 +64,20 @@
 
 (defcef "cl_cef_scheme_stop" :void)
 
+(defcef "cl_cef_request_decision_set" :void
+  (decision :pointer)
+  (block :int)
+  (css :string))
+
+(defcef "cl_cef_set_request_callback" :void
+  (callback :pointer))
+
+(defcef "cl_cef_request_pump" :int)
+
+(defcef "cl_cef_request_stop" :void)
+
+(defcef "cl_cef_adblock_reset_cosmetic" :void)
+
 (defcef "cl_cef_initialize" :int
   (argc :int)
   (argv :pointer)

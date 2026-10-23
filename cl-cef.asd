@@ -14,6 +14,7 @@
                bordeaux-threads
                cffi
                cl-json
+               cl-ppcre
                nclasses
                uiop)
   :components ((:module "lisp"
@@ -22,6 +23,7 @@
                 ((:file "package")
                  (:file "library" :depends-on ("package"))
                  (:file "core" :depends-on ("package" "library"))
+                 (:file "adblock" :depends-on ("package" "core"))
                  (:file "protocol" :depends-on ("package" "core"))
                  (:file "view" :depends-on ("package" "core"))
                  (:file "window" :depends-on ("package" "core" "view"))
@@ -32,7 +34,8 @@
 (defsystem "cl-cef/tests"
   :pathname "tests"
   :depends-on (cl-cef lisp-unit2)
-  :components ((:file "tests"))
+  :components ((:file "tests")
+               (:file "adblock" :depends-on ("tests")))
   :perform (test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call :lisp-unit2 :run-tests

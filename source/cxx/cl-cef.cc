@@ -28,6 +28,7 @@
 #include <cstdint>
 #endif
 #include <cmath>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -39,6 +40,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -54,6 +56,53 @@ struct cl_cef_response {
   std::string status_text = "OK";
   std::string headers;
 };
+
+struct cl_cef_request_decision {
+  int block = 0;
+  std::string css;
+};
+
+// SBCL leaves the invalid, overflow, and divide-by-zero traps unmasked for the
+// whole process. Chromium threads inherit that and a later floating-point
+// operation (the prompt's layout hit one) is delivered as SIGFPE to Lisp.
+void MaskFpTraps() {
+#if defined(__x86_64__)
+  unsigned int mxcsr = 0;
+  asm volatile("stmxcsr %0" : "=m"(mxcsr));
+  mxcsr |= 0x3fu << 7;
+  asm volatile("ldmxcsr %0" ::"m"(mxcsr));
+  unsigned short control = 0;
+  asm volatile("fnstcw %0" : "=m"(control));
+  control = static_cast<unsigned short>(control | 0x3fu);
+  asm volatile("fldcw %0" ::"m"(control));
+#else
+#endif
+}
+
+class ClosureTask : public CefTask {
+ public:
+  explicit ClosureTask(std::function<void()> fn) : fn_(std::move(fn)) {}
+  void Execute() override {
+    MaskFpTraps();
+    fn_();
+  }
+
+ private:
+  std::function<void()> fn_;
+  IMPLEMENT_REFCOUNTING(ClosureTask);
+};
+
+// CefCallback::Continue resumes a load only when it runs on the UI thread.
+void PostCefCallback(CefRefPtr<CefCallback> async, bool cancel) {
+  if (!async)
+    return;
+  CefPostTask(TID_UI, new ClosureTask([async, cancel]() {
+    if (cancel)
+      async->Cancel();
+    else
+      async->Continue();
+  }));
+}
 
 namespace {
 
@@ -196,53 +245,48 @@ std::atomic<cl_cef_event_callback> g_event_cb{nullptr};
 std::atomic<cl_cef_scheme_callback> g_scheme_cb{nullptr};
 std::atomic<bool> g_initialized{false};
 
-// Scheme handlers run on CEF's IO thread, which is not a Lisp thread.
-// Requests are handed to a Lisp thread and waited on.
+// Scheme handlers are entered on CEF's IO thread, which is not a Lisp thread.
+// The request is queued and continued later. Waiting here blocks every other
+// load, including adblock decisions, because they share that thread.
 struct SchemeJob {
   std::string scheme;
   std::string url;
   cl_cef_response response;
   std::promise<void> done;
+  std::mutex mu;
+  CefRefPtr<CefCallback> async;
 };
 
 std::mutex g_scheme_mu;
 std::condition_variable g_scheme_cv;
 std::queue<std::shared_ptr<SchemeJob>> g_scheme_queue;
 std::atomic<bool> g_scheme_stop{false};
-std::vector<std::string> g_args;
-std::vector<char*> g_argv;
 
-void MaskFpTraps();
-
-class ClosureTask : public CefTask {
- public:
-  explicit ClosureTask(std::function<void()> fn) : fn_(std::move(fn)) {}
-  void Execute() override {
-    MaskFpTraps();
-    fn_();
-  }
-
- private:
-  std::function<void()> fn_;
-  IMPLEMENT_REFCOUNTING(ClosureTask);
+// Adblock decisions also run on a Lisp thread. The IO thread cannot enter SBCL.
+struct RequestJob {
+  std::string url;
+  std::string document_url;
+  std::string type;
+  cl_cef_request_decision decision;
+  std::promise<void> done;
+  // Set for resource loads. Continue or Cancel is called on the IO thread.
+  CefRefPtr<CefCallback> async;
+  std::atomic<bool> settled{false};
 };
 
-// SBCL leaves the invalid, overflow, and divide-by-zero traps unmasked for the
-// whole process. Chromium threads inherit that and a later floating-point
-// operation (the prompt's layout hit one) is delivered as SIGFPE to Lisp.
-void MaskFpTraps() {
-#if defined(__x86_64__)
-  unsigned int mxcsr = 0;
-  asm volatile("stmxcsr %0" : "=m"(mxcsr));
-  mxcsr |= 0x3fu << 7;
-  asm volatile("ldmxcsr %0" ::"m"(mxcsr));
-  unsigned short control = 0;
-  asm volatile("fnstcw %0" : "=m"(control));
-  control = static_cast<unsigned short>(control | 0x3fu);
-  asm volatile("fldcw %0" ::"m"(control));
-#else
-#endif
-}
+std::mutex g_request_mu;
+std::condition_variable g_request_cv;
+std::queue<std::shared_ptr<RequestJob>> g_request_queue;
+std::atomic<bool> g_request_stop{false};
+std::atomic<cl_cef_request_callback> g_request_cb{nullptr};
+
+std::mutex g_cosmetic_mu;
+std::unordered_map<std::string, std::shared_ptr<const std::string>> g_cosmetic_by_url;
+std::unordered_map<std::string, std::shared_ptr<const std::string>> g_cosmetic_by_host;
+std::unordered_map<std::size_t, std::vector<std::shared_ptr<const std::string>>> g_cosmetic_intern;
+
+std::vector<std::string> g_args;
+std::vector<char*> g_argv;
 
 void PostUI(std::function<void()> fn) {
   if (CefCurrentlyOn(TID_UI)) {
@@ -468,26 +512,33 @@ class SchemeHandler : public CefResourceHandler {
   bool Open(CefRefPtr<CefRequest> request,
             bool& handle_request,
             CefRefPtr<CefCallback> callback) override {
-    (void)callback;
-    handle_request = true;
-    if (!request || !g_scheme_cb.load())
+    if (!request || !callback) {
+      handle_request = true;
+      return false;
+    }
+    // No Lisp handler yet. Answer an empty document, matching the previous
+    // synchronous path, instead of failing the navigation.
+    if (!g_scheme_cb.load()) {
+      handle_request = true;
       return true;
+    }
     auto job = std::make_shared<SchemeJob>();
     job->scheme = scheme_;
     job->url = request->GetURL().ToString();
+    job->async = callback;
+    // Publish the job before queueing it. The pump can finish and CEF can ask
+    // for headers as soon as the continuation runs.
+    job_ = job;
     {
       std::lock_guard<std::mutex> lock(g_scheme_mu);
-      if (g_scheme_stop.load())
-        return true;
+      if (g_scheme_stop.load()) {
+        handle_request = true;
+        return false;
+      }
       g_scheme_queue.push(job);
     }
     g_scheme_cv.notify_one();
-    job->done.get_future().wait();
-    data_ = std::move(job->response.data);
-    mime_ = job->response.mime.empty() ? "text/html" : job->response.mime;
-    status_ = job->response.status > 0 ? job->response.status : 200;
-    status_text_ = job->response.status_text.empty() ? "OK" : job->response.status_text;
-    headers_ = job->response.headers;
+    handle_request = false;
     return true;
   }
 
@@ -495,6 +546,7 @@ class SchemeHandler : public CefResourceHandler {
                           int64_t& response_length,
                           CefString& redirect_url) override {
     (void)redirect_url;
+    TakeResponse();
     if (response) {
       response->SetStatus(status_);
       response->SetStatusText(status_text_);
@@ -566,8 +618,22 @@ class SchemeHandler : public CefResourceHandler {
 
   void Cancel() override {}
 
+  void TakeResponse() {
+    if (!job_)
+      return;
+    // The pump writes the body, then unlocks this mutex, then continues the
+    // request. Locking here makes those writes visible.
+    std::lock_guard<std::mutex> lock(job_->mu);
+    data_ = job_->response.data;
+    mime_ = job_->response.mime.empty() ? "text/html" : job_->response.mime;
+    status_ = job_->response.status > 0 ? job_->response.status : 200;
+    status_text_ = job_->response.status_text.empty() ? "OK" : job_->response.status_text;
+    headers_ = job_->response.headers;
+  }
+
  private:
   std::string scheme_;
+  std::shared_ptr<SchemeJob> job_;
   std::string data_;
   std::string mime_;
   std::string status_text_;
@@ -671,6 +737,187 @@ class QueryHandler : public CefMessageRouterBrowserSide::Handler {
   int view_id_;
 };
 
+std::string HostOf(const std::string& url) {
+  auto scheme = url.find("://");
+  std::size_t start = scheme == std::string::npos ? 0 : scheme + 3;
+  auto end = url.find_first_of("/?#", start);
+  auto at = url.find('@', start);
+  if (at != std::string::npos && (end == std::string::npos || at < end))
+    start = at + 1;
+  if (end == std::string::npos)
+    end = url.size();
+  auto colon = url.find(':', start);
+  if (colon != std::string::npos && colon < end)
+    end = colon;
+  std::string host = url.substr(start, end - start);
+  if (!host.empty() && host.front() == '[') {
+    auto close = host.find(']');
+    if (close != std::string::npos)
+      host = host.substr(1, close - 1);
+  }
+  for (char& character : host)
+    character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+  return host;
+}
+
+std::string UrlKey(const std::string& url) {
+  auto hash = url.find('#');
+  std::string key = hash == std::string::npos ? url : url.substr(0, hash);
+  for (char& character : key)
+    character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+  return key;
+}
+
+const char* ResourceTypeName(cef_resource_type_t type) {
+  switch (type) {
+    case RT_MAIN_FRAME:
+      return "document";
+    case RT_SUB_FRAME:
+      return "subdocument";
+    case RT_STYLESHEET:
+      return "stylesheet";
+    case RT_SCRIPT:
+      return "script";
+    case RT_IMAGE:
+    case RT_FAVICON:
+      return "image";
+    case RT_FONT_RESOURCE:
+      return "font";
+    case RT_OBJECT:
+    case RT_PLUGIN_RESOURCE:
+      return "object";
+    case RT_MEDIA:
+      return "media";
+    case RT_XHR:
+      return "xmlhttprequest";
+    case RT_PING:
+      return "ping";
+    default:
+      return "other";
+  }
+}
+
+std::string DocumentUrl(CefRefPtr<CefRequest> request, CefRefPtr<CefFrame> frame) {
+  if (!request)
+    return {};
+  if (request->GetResourceType() == RT_MAIN_FRAME)
+    return request->GetURL().ToString();
+  if (request->GetResourceType() == RT_SUB_FRAME && frame) {
+    auto parent = frame->GetParent();
+    if (parent) {
+      std::string url = parent->GetURL().ToString();
+      if (!url.empty())
+        return url;
+    }
+  }
+  if (frame) {
+    std::string url = frame->GetURL().ToString();
+    if (!url.empty() && url != "about:blank")
+      return url;
+  }
+  return request->GetURL().ToString();
+}
+
+std::shared_ptr<const std::string> InternCosmetic(const std::string& css) {
+  std::size_t hash = std::hash<std::string>{}(css);
+  auto& bucket = g_cosmetic_intern[hash];
+  for (const auto& entry : bucket) {
+    if (*entry == css)
+      return entry;
+  }
+  auto shared = std::make_shared<const std::string>(css);
+  bucket.push_back(shared);
+  return shared;
+}
+
+void RememberCosmetic(const std::string& url, const std::string& css) {
+  std::lock_guard<std::mutex> lock(g_cosmetic_mu);
+  auto shared = InternCosmetic(css);
+  g_cosmetic_by_url[UrlKey(url)] = shared;
+  std::string host = HostOf(url);
+  if (!host.empty())
+    g_cosmetic_by_host[host] = shared;
+}
+
+std::string CosmeticFor(const std::string& url) {
+  std::lock_guard<std::mutex> lock(g_cosmetic_mu);
+  auto exact = g_cosmetic_by_url.find(UrlKey(url));
+  if (exact != g_cosmetic_by_url.end() && exact->second)
+    return *exact->second;
+  auto fallback = g_cosmetic_by_host.find(HostOf(url));
+  if (fallback != g_cosmetic_by_host.end() && fallback->second)
+    return *fallback->second;
+  return {};
+}
+
+void ResetCosmetic() {
+  std::lock_guard<std::mutex> lock(g_cosmetic_mu);
+  g_cosmetic_by_url.clear();
+  g_cosmetic_by_host.clear();
+  g_cosmetic_intern.clear();
+}
+
+// CEF's own async resource test resumes CefCallback on the UI thread. Calling
+// Continue from the Lisp thread, or from a raw std::thread, never starts the
+// load. ClosureTask also masks the FP traps SBCL leaves on.
+void ResumeCallback(const CefRefPtr<CefCallback>& async, bool block) {
+  PostCefCallback(async, block);
+}
+
+void FinishRequest(const std::shared_ptr<RequestJob>& job) {
+  if (!job || job->settled.exchange(true))
+    return;
+  bool block = job->decision.block != 0;
+  // Resume the load before any further work. A throw while storing CSS must
+  // not leave the request parked in OnBeforeResourceLoad.
+  ResumeCallback(job->async, block);
+  if (!block && (job->type == "document" || job->type == "subdocument"))
+    RememberCosmetic(job->url, job->decision.css);
+}
+
+void ArmRequestTimeout(const std::shared_ptr<RequestJob>& job) {
+  if (!job || !job->async)
+    return;
+  std::thread([job]() {
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    if (job->settled.exchange(true))
+      return;
+    ResumeCallback(job->async, false);
+  }).detach();
+}
+
+bool HttpUrl(const std::string& url) {
+  return url.compare(0, 7, "http://") == 0 ||
+         (url.size() >= 8 && url.compare(0, 8, "https://") == 0);
+}
+
+// Returns true when the request should be cancelled. CSS is filled for every
+// call that reaches Lisp, including an empty sheet, so a later navigation can
+// replace an older one for the same host.
+bool ConsultBlocker(const std::string& url,
+                    const std::string& document_url,
+                    const char* type,
+                    std::string* css) {
+  if (!g_request_cb.load() || !type || !HttpUrl(url))
+    return false;
+  auto job = std::make_shared<RequestJob>();
+  job->url = url;
+  job->document_url = document_url;
+  job->type = type;
+  {
+    std::lock_guard<std::mutex> lock(g_request_mu);
+    if (g_request_stop.load())
+      return false;
+    g_request_queue.push(job);
+  }
+  g_request_cv.notify_one();
+  if (job->done.get_future().wait_for(std::chrono::seconds(2)) != std::future_status::ready)
+    return false;
+  if (css)
+    *css = job->decision.css;
+  return job->decision.block != 0;
+}
+
 class Client : public CefClient,
                public CefLifeSpanHandler,
                public CefLoadHandler,
@@ -735,8 +982,10 @@ class Client : public CefClient,
                      CefRefPtr<CefDictionaryValue>& extra_info,
                      bool* no_javascript_access) override {
     (void)browser;
-    (void)frame;
     (void)popup_id;
+    (void)frame;
+    // Deciding here would wait on the UI thread. Nyxt cancels the popup below
+    // and opens the URL itself.
     (void)target_frame_name;
     (void)target_disposition;
     (void)user_gesture;
@@ -792,6 +1041,9 @@ class Client : public CefClient,
       return;
     auto view = FindView(view_id_);
     ApplyScripts(view, frame, true);
+    std::string cosmetic = CosmeticFor(frame->GetURL().ToString());
+    if (!cosmetic.empty())
+      ApplyCss(frame, "cl-cef-adblock", cosmetic);
     if (!frame->IsMain())
       return;
     Emit(view_id_,
@@ -909,6 +1161,34 @@ class Client : public CefClient,
     (void)request_initiator;
     (void)disable_default_handling;
     return this;
+  }
+
+  CefResourceRequestHandler::ReturnValue OnBeforeResourceLoad(
+      CefRefPtr<CefBrowser> browser,
+      CefRefPtr<CefFrame> frame,
+      CefRefPtr<CefRequest> request,
+      CefRefPtr<CefCallback> callback) override {
+    (void)browser;
+    if (!request || !callback)
+      return RV_CONTINUE;
+    std::string url = request->GetURL().ToString();
+    const char* type = ResourceTypeName(request->GetResourceType());
+    if (!g_request_cb.load() || !type || !HttpUrl(url))
+      return RV_CONTINUE;
+    auto job = std::make_shared<RequestJob>();
+    job->url = url;
+    job->document_url = DocumentUrl(request, frame);
+    job->type = type;
+    job->async = callback;
+    {
+      std::lock_guard<std::mutex> lock(g_request_mu);
+      if (g_request_stop.load())
+        return RV_CONTINUE;
+      g_request_queue.push(job);
+    }
+    g_request_cv.notify_one();
+    ArmRequestTimeout(job);
+    return RV_CONTINUE_ASYNC;
   }
 
   void OnResourceRedirect(CefRefPtr<CefBrowser> browser,
@@ -1201,10 +1481,27 @@ int cl_cef_scheme_pump(void) {
     g_scheme_queue.pop();
   }
   cl_cef_scheme_callback callback = g_scheme_cb.load();
-  if (callback && job)
-    callback(job->scheme.c_str(), job->url.c_str(), &job->response);
-  if (job)
-    job->done.set_value();
+  if (callback && job) {
+    try {
+      callback(job->scheme.c_str(), job->url.c_str(), &job->response);
+    } catch (...) {
+      job->response.status = 500;
+      job->response.status_text = "Error";
+      job->response.mime = "text/plain";
+      job->response.data = "scheme handler failed";
+    }
+  }
+  if (job) {
+    // Publish the body before Continue. GetResponseHeaders locks this mutex.
+    job->mu.lock();
+    job->mu.unlock();
+    if (job->async)
+      PostCefCallback(job->async, false);
+    try {
+      job->done.set_value();
+    } catch (...) {
+    }
+  }
   return 1;
 }
 
@@ -1212,11 +1509,79 @@ void cl_cef_scheme_stop(void) {
   std::lock_guard<std::mutex> lock(g_scheme_mu);
   g_scheme_stop.store(true);
   while (!g_scheme_queue.empty()) {
-    g_scheme_queue.front()->done.set_value();
+    auto pending = g_scheme_queue.front();
     g_scheme_queue.pop();
+    if (pending->async)
+      PostCefCallback(pending->async, true);
+    try {
+      pending->done.set_value();
+    } catch (...) {
+    }
   }
   g_scheme_cv.notify_all();
 }
+
+void cl_cef_request_decision_set(cl_cef_request_decision* decision, int block, const char* css) {
+  if (!decision)
+    return;
+  decision->block = block ? 1 : 0;
+  decision->css = css ? css : "";
+}
+
+void cl_cef_set_request_callback(cl_cef_request_callback callback) {
+  g_request_stop.store(false);
+  g_request_cb.store(callback);
+  g_request_cv.notify_all();
+}
+
+int cl_cef_request_pump(void) {
+  std::shared_ptr<RequestJob> job;
+  {
+    std::unique_lock<std::mutex> lock(g_request_mu);
+    g_request_cv.wait(lock, [] { return g_request_stop.load() || !g_request_queue.empty(); });
+    if (g_request_queue.empty())
+      return 0;
+    job = std::move(g_request_queue.front());
+    g_request_queue.pop();
+  }
+  cl_cef_request_callback callback = g_request_cb.load();
+  if (callback && job) {
+    try {
+      callback(job->url.c_str(), job->document_url.c_str(), job->type.c_str(), &job->decision);
+    } catch (...) {
+      job->decision.block = 0;
+      job->decision.css.clear();
+    }
+  }
+  if (job) {
+    try {
+      FinishRequest(job);
+    } catch (...) {
+      job->decision.block = 0;
+      if (!job->settled.load())
+        FinishRequest(job);
+    }
+    try {
+      job->done.set_value();
+    } catch (...) {
+    }
+  }
+  return 1;
+}
+
+void cl_cef_request_stop(void) {
+  std::lock_guard<std::mutex> lock(g_request_mu);
+  g_request_stop.store(true);
+  while (!g_request_queue.empty()) {
+    std::shared_ptr<RequestJob> job = g_request_queue.front();
+    g_request_queue.pop();
+    FinishRequest(job);
+    job->done.set_value();
+  }
+  g_request_cv.notify_all();
+}
+
+void cl_cef_adblock_reset_cosmetic(void) { ResetCosmetic(); }
 
 int cl_cef_initialize(int argc,
                       char** argv,

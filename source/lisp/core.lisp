@@ -404,6 +404,46 @@ thread. When ONCE-P is non-nil, CALLBACK is removed after it runs."))
       (free-argv argc argv)
       (setf (slot-value interface 'argv-pointers) nil))))
 
+(defvar *request-decider* nil
+  "Function of (url document-url type-name). Returns blockp and a stylesheet.
+The stylesheet is injected into document and subdocument loads. NIL allows
+every request.")
+
+(cffi:defcallback request-callback :void
+    ((url :string) (document-url :string) (resource-type :string) (decision :pointer))
+  (handler-case
+      (if *request-decider*
+          (multiple-value-bind (blockp css)
+              (funcall *request-decider* url document-url resource-type)
+            (cl-cef-request-decision-set decision (if blockp 1 0) (or css "")))
+          (cl-cef-request-decision-set decision 0 ""))
+    (error (condition)
+      (warn "cl-cef request filter error: ~a" condition)
+      (cl-cef-request-decision-set decision 0 ""))))
+
+(defvar *request-thread* nil
+  "Lisp thread that decides whether a network request is blocked.
+CEF calls the handler on its IO thread, which cannot enter Lisp.")
+
+(defun start-request-thread ()
+  (when (and *request-thread* (bt:thread-alive-p *request-thread*))
+    (return-from start-request-thread *request-thread*))
+  (setf *request-thread*
+        (bt:make-thread
+         (lambda ()
+           (loop while (plusp (cl-cef-request-pump))))
+         :name "cl-cef request thread")))
+
+(defun install-request-blocker ()
+  "Register `*request-decider*' and start the thread that answers requests."
+  (cl-cef-set-request-callback (cffi:callback request-callback))
+  (start-request-thread))
+
+(defun reset-adblock-cosmetic ()
+  "Forget element-hiding stylesheets held by the bridge."
+  (when *library-loaded-p*
+    (cl-cef-adblock-reset-cosmetic)))
+
 (defvar *scheme-thread* nil
   "Lisp thread that serves custom-scheme requests.
 CEF calls scheme handlers on its IO thread, which cannot enter Lisp.")
@@ -448,6 +488,8 @@ CEF calls scheme handlers on its IO thread, which cannot enter Lisp.")
   ;; After CefInitialize. Chromium forks its subprocess around that call, so
   ;; this thread must not exist yet.
   (start-scheme-thread)
+  (when *request-decider*
+    (install-request-blocker))
   #+sbcl
   (pushnew 'terminate sb-ext:*exit-hooks*)
   t)
@@ -464,6 +506,7 @@ CEF calls scheme handlers on its IO thread, which cannot enter Lisp.")
   (unless (and interface (alive-p interface))
     (warn "Already terminated, nothing to do.")
     (return-from terminate nil))
+  (cl-cef-request-stop)
   (cl-cef-scheme-stop)
   (cl-cef-quit-message-loop)
   t)

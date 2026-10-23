@@ -57,6 +57,33 @@ void cl_cef_set_scheme_callback(cl_cef_scheme_callback callback);
 int cl_cef_scheme_pump(void);
 void cl_cef_scheme_stop(void);
 
+/* Opaque decision filled by cl_cef_request_decision_set. */
+typedef struct cl_cef_request_decision cl_cef_request_decision;
+
+/*
+ * URL, DOCUMENT_URL, and RESOURCE_TYPE are NUL-terminated. RESOURCE_TYPE is an
+ * adblock type such as "script" or "document". DECISION stays valid for the
+ * call. The callback runs on the thread that pumps cl_cef_request_pump, not
+ * on CEF's IO thread.
+ */
+typedef void (*cl_cef_request_callback)(const char* url,
+                                        const char* document_url,
+                                        const char* resource_type,
+                                        cl_cef_request_decision* decision);
+
+void cl_cef_request_decision_set(cl_cef_request_decision* decision,
+                                 int block,
+                                 const char* css);
+void cl_cef_set_request_callback(cl_cef_request_callback callback);
+
+/* Blocks until one request has been decided, then returns 1.
+ * Returns 0 after cl_cef_request_stop. Call from a Lisp thread. */
+int cl_cef_request_pump(void);
+void cl_cef_request_stop(void);
+
+/* Drops stylesheets remembered for element hiding. */
+void cl_cef_adblock_reset_cosmetic(void);
+
 /*
  * ARGV is copied. SCHEMES is "name:bitmask,name:bitmask" and is published in
  * the CL_CEF_SCHEMES environment variable before CEF starts, so the subprocess

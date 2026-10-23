@@ -27,6 +27,14 @@ Scheme names and their privilege bits are fixed before =CefInitialize=. Chromium
 
 A handler runs on CEF's IO thread, which is not a Lisp thread. The bridge queues the request and a dedicated Lisp thread, started after =CefInitialize=, answers it. The callback receives the URL and returns the body, a MIME type, a status code, response headers, and a reason phrase. A MIME type such as =text/html;charset=utf-8= is split: CEF's =SetMimeType= rejects parameters, so the type and the charset are set separately.
 
+* Ad blocking
+
+=adblocker= reads uBlock Origin and Adblock Plus filter lists. =load-filters= accepts a string, a pathname, or a list of either. =blocked-p= answers one request. =enable= installs the engine on CEF's network path. The IO thread queues the URL, the document URL, and the resource type, then returns immediately so scheme handlers and other loads keep running. A Lisp thread decides, and a decision that takes longer than two seconds is allowed.
+
+=default-block= enables the engine and loads uBlock Origin's default lists in the background. The lists are cached under the XDG cache directory and refreshed every four days. =cosmetic-css= is the element-hiding stylesheet for a page; document loads inject it.
+
+Network filters (including =||=, =^=, =$domain==, party and type options, exceptions, and =$important=) and element-hiding cosmetic filters are applied. =$generichide=, =$specificelemhide=, =$elemhide=, and =$genericblock= are honored. Scriptlets, HTML filters, and modifiers that rewrite a request instead of blocking it (=csp=, =removeparam=, =rewrite=, =header=) are skipped.
+
 * Building
 
 CEF 124 or newer is required. =CEF_ROOT= is a binary distribution, the directory that contains =include/=, =Release/=, and =cmake/=.
