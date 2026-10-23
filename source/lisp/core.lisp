@@ -405,17 +405,19 @@ thread. When ONCE-P is non-nil, CALLBACK is removed after it runs."))
       (setf (slot-value interface 'argv-pointers) nil))))
 
 (defvar *request-decider* nil
-  "Function of (url document-url type-name). Returns blockp and a stylesheet.
-The stylesheet is injected into document and subdocument loads. NIL allows
-every request.")
+  "Function of (url document-url type-name). Returns blockp, a stylesheet, and
+a replacement encoding. The stylesheet is injected into document and
+subdocument loads. The replacement encoding rewrites the response body.
+NIL allows every request.")
 
 (cffi:defcallback request-callback :void
     ((url :string) (document-url :string) (resource-type :string) (decision :pointer))
   (handler-case
       (if *request-decider*
-          (multiple-value-bind (blockp css)
+          (multiple-value-bind (blockp css replacements)
               (funcall *request-decider* url document-url resource-type)
-            (cl-cef-request-decision-set decision (if blockp 1 0) (or css "")))
+            (cl-cef-request-decision-set decision (if blockp 1 0) (or css ""))
+            (cl-cef-request-decision-replace decision (or replacements "")))
           (cl-cef-request-decision-set decision 0 ""))
     (error (condition)
       (warn "cl-cef request filter error: ~a" condition)

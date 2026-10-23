@@ -5,9 +5,17 @@
 ;;;;
 ;;;; Network filters are indexed by hostname or by a literal token, which is
 ;;;; what keeps a full EasyList match off the linear scan. Cosmetic filters
-;;;; become one stylesheet per page. Scriptlets, HTML filters, and request
-;;;; modifiers that do not block (`$csp', `$removeparam', `$rewrite',
-;;;; `$header') are skipped: applying them as blocks would change their meaning.
+;;;; become one stylesheet per page. A literal `$replace' rewrites the response
+;;;; body instead of blocking the request. Scriptlets, HTML filters, regex
+;;;; `$replace', and the other modifiers that do not block (`$csp',
+;;;; `$removeparam', `$rewrite', `$header') are skipped: applying them as
+;;;; blocks would change their meaning.
+;;;;
+;;;; YouTube's pre-roll is decided before the video starts, from `adPlacements'
+;;;; and `adSlots' in the player response. Firefox uBlock Origin renames those
+;;;; keys with `$replace' on the player request, and undefines them on
+;;;; `ytInitialPlayerResponse' for the document itself. The same renames are
+;;;; applied here to those responses.
 
 (in-package :cef)
 
@@ -446,6 +454,7 @@ contains another one, and that is still a plain filter."
   (active-p t)
   (host-key nil)
   (token-key nil)
+  (replacements nil :type list)
   (stamp 0 :type integer))
 
 (defstruct cosmetic-rule
@@ -570,6 +579,39 @@ contains another one, and that is still a plain filter."
         '("csp=" "removeparam=" "rewrite=" "redirect-rule" "header=" "method="
           "permissions=" "denyallow=" "urlskip=" "reason=" "queryprune=")))
 
+(defun replace-metacharacter-p (char)
+  "Characters that make a `$replace' pattern a regular expression."
+  (member char '(#\. #\* #\+ #\? #\^ #\$ #\{ #\} #\( #\) #\| #\[ #\] #\\)))
+
+(defun parse-replace-value (value)
+  "Parse a literal `$replace=/pattern/replacement/' option.
+Returns (PATTERN . REPLACEMENT), or NIL when VALUE is absent or a regex.
+uBlock applies a regex here. A regex left in place would be searched for as
+text, so those options are refused and the filter is dropped."
+  (when (and value (>= (length value) 4) (char= (char value 0) #\/))
+    (let ((index 1))
+      (labels ((read-piece ()
+                 (let ((chars nil)
+                       (escaped nil))
+                   (loop while (< index (length value))
+                         for char = (char value index)
+                         do (incf index)
+                         (cond
+                           (escaped
+                            (push char chars)
+                            (setf escaped nil))
+                           ((char= char #\\)
+                            (setf escaped t))
+                           ((char= char #\/)
+                            (return (coerce (nreverse chars) 'string)))
+                           (t (push char chars)))
+                         finally (return nil)))))
+        (let ((pattern (read-piece))
+              (replacement (read-piece)))
+          (when (and pattern replacement (plusp (length pattern))
+                     (notany #'replace-metacharacter-p pattern))
+            (cons pattern replacement)))))))
+
 (defun filter-key (exception-p body tokens match-case)
   (format nil "~a~a~@[~a~]"
           (if exception-p "@@" "")
@@ -595,6 +637,7 @@ contains another one, and that is still a plain filter."
             (to-excluded nil)
             (important nil)
             (match-case nil)
+            (replacements nil)
             (unknown nil))
         (dolist (raw (if options (split-by #\, options) nil))
           (let* ((text (string-trim '(#\Space #\Tab) raw))
@@ -616,6 +659,13 @@ contains another one, and that is still a plain filter."
                (multiple-value-bind (yes no) (parse-domain-list value)
                  (setf to-domains yes to-excluded no))
                (push (format nil "to=~a" (string-downcase (or value ""))) tokens))
+              ((string= key "replace")
+               (let ((parsed (parse-replace-value value)))
+                 (unless parsed
+                   (setf unknown t))
+                 (when parsed
+                   (setf replacements (append replacements (list parsed)))
+                   (push (format nil "replace=~a" (string-downcase (or value ""))) tokens))))
               ((member key '("redirect" "empty") :test #'string=)
                (push (if value (format nil "~a=~a" key value) key) tokens))
               ((or (string= key "third-party") (string= key "3p"))
@@ -694,7 +744,8 @@ contains another one, and that is still a plain filter."
                          :exception-p exception
                          :important-p important
                          :host-key host
-                         :token-key (unless host token))))))))))
+                         :token-key (unless host token)
+                         :replacements replacements)))))))))
 
 (defun normalize-selector (selector)
   (let ((text (string-trim '(#\Space #\Tab #\Return) selector)))
@@ -1024,7 +1075,8 @@ default lists."))
     (each-candidate
      adblocker request-host folded
      (lambda (filter)
-       (when (and (or (not genericblock)
+       (when (and (null (network-filter-replacements filter))
+                  (or (not genericblock)
                       (network-filter-exception-p filter)
                       (not (generic-filter-p filter)))
                   (filter-matches-p filter url folded type request-host document-host))
@@ -1116,6 +1168,108 @@ default lists."))
                                      selectors)))
                       (selectors-to-css selectors))))))))
 
+(defun add-replacement (pairs pair)
+  (if (member pair pairs :test #'equal)
+      pairs
+      (append pairs (list pair))))
+
+(defun youtube-host-p (host)
+  "Whether HOST is a YouTube site whose player response carries pre-roll ads."
+  (and host
+       (or (member host '("youtube.com" "youtube-nocookie.com" "youtubekids.com")
+                   :test #'string=)
+           (alexandria:ends-with-subseq ".youtube.com" host)
+           (alexandria:ends-with-subseq ".youtube-nocookie.com" host)
+           (alexandria:ends-with-subseq ".youtubekids.com" host))))
+
+(defparameter *youtube-player-replacements*
+  '(("\"adPlacements\"" . "\"no_ads\"")
+    ("\"adSlots\"" . "\"no_ads\""))
+  "Renames Firefox uBlock Origin applies to YouTube player responses.
+The player looks the original keys up before it starts the video. A missing
+key means there is no pre-roll.")
+
+(defparameter *youtube-document-replacements*
+  '(("\"adPlacements\"" . "\"no_ads\"")
+    ("\"playerAds\"" . "\"no_ads\"")
+    ("\"adSlots\"" . "\"no_ads\""))
+  "Renames for the watch document. `ytInitialPlayerResponse' is embedded in
+the HTML, and uBlock's `set' scriptlet undefines these three properties on it
+before the player reads them.")
+
+(defun youtube-player-response-p (folded host document-host type)
+  "Whether this is a YouTube player fetch rather than the video stream.
+`fetch' is reported as xhr on some CEF builds and as other on others. The
+document has to be a YouTube page, so a third-party site that mentions the
+player URL is left alone."
+  (and (member type '(:xmlhttprequest :other))
+       (youtube-host-p document-host)
+       (or (search "/youtubei/v1/player" folded)
+           (search "/youtubei/v1/get_watch" folded)
+           (and (host-matches-domain-p host "www.youtube.com")
+                (or (search "/watch?" folded)
+                    (search "/playlist?list=" folded))))))
+
+(defun youtube-ad-replacements (url document-url type)
+  "Body renames that remove a YouTube pre-roll before the player sees it.
+NIL when URL is not one of those responses."
+  (let* ((folded (string-downcase (strip-fragment url)))
+         (document (string-downcase (strip-fragment (or document-url url))))
+         (host (url-host folded))
+         (document-host (url-host document)))
+    (cond
+      ((youtube-player-response-p folded host document-host type)
+       *youtube-player-replacements*)
+      ((and (member type '(:document :subdocument))
+            (youtube-host-p host))
+       *youtube-document-replacements*))))
+
+(defun collect-replacements (adblocker url document-url type)
+  (let* ((url (strip-fragment url))
+         (document-url (strip-fragment (or document-url url)))
+         (folded (string-downcase url))
+         (folded-document (if (string= url document-url)
+                              folded
+                              (string-downcase document-url)))
+         (request-host (url-host folded))
+         (document-host (url-host folded-document))
+         (pairs nil))
+    (each-candidate
+     adblocker request-host folded
+     (lambda (filter)
+       (when (and (network-filter-replacements filter)
+                  (not (network-filter-exception-p filter))
+                  (filter-matches-p filter url folded type request-host document-host))
+         (dolist (pair (network-filter-replacements filter))
+           (setf pairs (add-replacement pairs pair))))))
+    (dolist (pair (youtube-ad-replacements url document-url type))
+      (setf pairs (add-replacement pairs pair)))
+    pairs))
+
+(defun encode-replacements (pairs)
+  "Length-prefixed UTF-8 encoding of (NEEDLE . REPLACEMENT) pairs.
+The C bridge reads the lengths as bytes. Empty when there is nothing to rewrite."
+  (if (null pairs)
+      ""
+      (with-output-to-string (stream)
+        (format stream "~d~%" (length pairs))
+        (dolist (pair pairs)
+          (let ((from (car pair))
+                (to (cdr pair)))
+            (format stream "~d~%" (length (babel:string-to-octets from :encoding :utf-8)))
+            (write-string from stream)
+            (format stream "~d~%" (length (babel:string-to-octets to :encoding :utf-8)))
+            (write-string to stream))))))
+
+(export-always 'response-replacements)
+(defmethod response-replacements ((adblocker adblocker) url &key (document-url url) (type :other))
+  "Alist of literal body substitutions for URL.
+Each entry is (NEEDLE . REPLACEMENT). The request is still loaded. Empty when
+the body should pass through unchanged."
+  (let ((type (if (keywordp type) type (canonicalize-type type))))
+    (bt:with-recursive-lock-held ((update-lock adblocker))
+      (collect-replacements adblocker url document-url type))))
+
 (export-always 'blocked-p)
 (defmethod blocked-p ((adblocker adblocker) url &key (document-url url) (type :other))
   "Whether ADBLOCKER blocks URL for the page DOCUMENT-URL.
@@ -1134,7 +1288,8 @@ TYPE is a keyword such as :script, :image, :document, :subdocument, or
 (defgeneric load-filters (adblocker source)
   (:documentation "Add uBlock Origin and Adblock Plus filters from SOURCE.
 SOURCE is a filter list string, a pathname, a stream, or a list of those.
-Scriptlets and modifiers that rewrite a request instead of blocking it are skipped.")
+A literal `$replace' rewrites the response. Scriptlets, regex `$replace', and
+modifiers that rewrite a request instead of blocking it are skipped.")
   (:method ((adblocker adblocker) (source string))
     (commit-batch adblocker (parse-filter-text source)))
   (:method ((adblocker adblocker) (source pathname))
@@ -1214,11 +1369,15 @@ A download failure falls back to the cached copy of that list."
   (lambda (url document-url type-name)
     (let ((type (canonicalize-type type-name)))
       (if (blocked-p adblocker url :document-url document-url :type type)
-          (values t "")
+          (values t "" "")
           (values nil
                   (if (member type '(:document :subdocument))
                       (cosmetic-css adblocker url)
-                      ""))))))
+                      "")
+                  (encode-replacements
+                   (response-replacements adblocker url
+                                          :document-url document-url
+                                          :type type)))))))
 
 (export-always '*adblocker*)
 (defvar *adblocker* nil

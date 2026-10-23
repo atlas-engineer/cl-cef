@@ -155,6 +155,57 @@ example.com##.sponsor
     (assert-true (search ".ad-banner" (cef:cosmetic-css engine "https://elsewhere.test/")))
     (assert-string= "" (cef:cosmetic-css engine "https://clean.example/account"))))
 
+(define-test youtube-preroll-is-removed-before-playback ()
+  ;; Firefox uBlock Origin renames these keys in the player response. The player
+  ;; reads them before starting the video, so the pre-roll never begins.
+  (let ((engine (make-instance 'cef:adblocker))
+        (player "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+        (watch "https://www.youtube.com/watch?v=abc"))
+    (let ((xhr (cef:response-replacements engine player
+                                          :document-url watch
+                                          :type :xmlhttprequest)))
+      (assert-true (find "\"adPlacements\"" xhr :key #'car :test #'string=))
+      (assert-true (find "\"adSlots\"" xhr :key #'car :test #'string=))
+      (assert-false (find "\"playerAds\"" xhr :key #'car :test #'string=)))
+    (assert-false (cef:blocked-p engine player :document-url watch :type :xmlhttprequest))
+    (let ((document (cef:response-replacements engine watch :type :document)))
+      (assert-true (find "\"adPlacements\"" document :key #'car :test #'string=))
+      (assert-true (find "\"playerAds\"" document :key #'car :test #'string=))
+      (assert-true (find "\"adSlots\"" document :key #'car :test #'string=)))
+    ;; The same player URL fetched by some other site is not a YouTube pre-roll.
+    (assert-false (cef:response-replacements engine player
+                                             :document-url "https://example.com/"
+                                             :type :xmlhttprequest))
+    (assert-false (cef:response-replacements engine "https://example.com/" :type :document))
+    ;; An embed's player call is first-party to the frame, including googleapis.
+    (assert-true (cef:response-replacements
+                  engine
+                  "https://youtubei.googleapis.com/youtubei/v1/player?key=abc"
+                  :document-url "https://www.youtube-nocookie.com/embed/abc"
+                  :type :other))
+    ;; The video bytes themselves are not rewritten.
+    (assert-false (cef:response-replacements
+                   engine
+                   "https://rr3---sn.googlevideo.com/videoplayback?id=1"
+                   :document-url watch
+                   :type :media))))
+
+(define-test literal-replace-rewrites-and-does-not-block ()
+  (let ((engine (adblock-from "||ads.example/player?$xhr,1p,replace=/\"adPlacements\"/\"no_ads\"/
+||ads.example^$xhr,replace=/a.+b/c/")))
+    (assert-false (cef:blocked-p engine "https://ads.example/player?x=1"
+                                  :document-url "https://ads.example/"
+                                  :type :xmlhttprequest))
+    (let ((pairs (cef:response-replacements engine "https://ads.example/player?x=1"
+                                            :document-url "https://ads.example/"
+                                            :type :xmlhttprequest)))
+      (assert-equal "\"no_ads\"" (cdr (assoc "\"adPlacements\"" pairs :test #'string=))))
+    ;; A regex `$replace' is not searched for as literal text, and it is not a block.
+    (assert-false (cef:blocked-p engine "https://ads.example/banner" :type :xmlhttprequest))
+    (assert-false (cef:response-replacements engine "https://ads.example/banner"
+                                             :document-url "https://ads.example/"
+                                             :type :xmlhttprequest))))
+
 (define-test indexed-host-rules-do-not-match-unrelated-urls ()
   (let ((engine (make-instance 'cef:adblocker)))
     (cef:load-filters

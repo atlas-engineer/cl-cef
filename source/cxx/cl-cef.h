@@ -74,6 +74,11 @@ typedef void (*cl_cef_request_callback)(const char* url,
 void cl_cef_request_decision_set(cl_cef_request_decision* decision,
                                  int block,
                                  const char* css);
+
+/* REPLACEMENTS is the length-prefixed body rewrite from the adblocker.
+ * Empty leaves the body unchanged. Call after cl_cef_request_decision_set. */
+void cl_cef_request_decision_replace(cl_cef_request_decision* decision,
+                                     const char* replacements);
 void cl_cef_set_request_callback(cl_cef_request_callback callback);
 
 /* Blocks until one request has been decided, then returns 1.

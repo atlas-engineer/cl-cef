@@ -13,6 +13,7 @@
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_parser.h"
+#include "include/cef_response_filter.h"
 #include "include/base/cef_build.h"
 #include "include/views/cef_box_layout.h"
 #include "include/views/cef_browser_view.h"
@@ -60,6 +61,8 @@ struct cl_cef_response {
 struct cl_cef_request_decision {
   int block = 0;
   std::string css;
+  // Length-prefixed needle/replacement pairs. Empty when the body passes through.
+  std::string replacements;
 };
 
 // SBCL leaves the invalid, overflow, and divide-by-zero traps unmasked for the
@@ -267,6 +270,7 @@ struct RequestJob {
   std::string url;
   std::string document_url;
   std::string type;
+  uint64_t id = 0;
   cl_cef_request_decision decision;
   std::promise<void> done;
   // Set for resource loads. Continue or Cancel is called on the IO thread.
@@ -864,10 +868,41 @@ void ResumeCallback(const CefRefPtr<CefCallback>& async, bool block) {
   PostCefCallback(async, block);
 }
 
+// Encoded substitutions, keyed by CefRequest::GetIdentifier. Parsed when the
+// response headers arrive. Defined up here because FinishRequest runs first.
+std::mutex g_replace_mu;
+std::unordered_map<uint64_t, std::string> g_replace_text;
+
+void RememberReplacements(uint64_t id, const std::string& text) {
+  if (id == 0 || text.empty())
+    return;
+  std::lock_guard<std::mutex> lock(g_replace_mu);
+  if (g_replace_text.size() > 2048)
+    g_replace_text.clear();
+  g_replace_text[id] = text;
+}
+
+std::string ReplacementsText(uint64_t id) {
+  std::lock_guard<std::mutex> lock(g_replace_mu);
+  auto found = g_replace_text.find(id);
+  if (found == g_replace_text.end())
+    return {};
+  return found->second;
+}
+
+void ForgetReplacements(uint64_t id) {
+  std::lock_guard<std::mutex> lock(g_replace_mu);
+  g_replace_text.erase(id);
+}
+
 void FinishRequest(const std::shared_ptr<RequestJob>& job) {
   if (!job || job->settled.exchange(true))
     return;
   bool block = job->decision.block != 0;
+  // The response filter runs after Continue, so the substitutions have to be
+  // recorded first. A blocked request has no body to rewrite.
+  if (!block)
+    RememberReplacements(job->id, job->decision.replacements);
   // Resume the load before any further work. A throw while storing CSS must
   // not leave the request parked in OnBeforeResourceLoad.
   ResumeCallback(job->async, block);
@@ -890,6 +925,172 @@ bool HttpUrl(const std::string& url) {
   return url.compare(0, 7, "http://") == 0 ||
          (url.size() >= 8 && url.compare(0, 8, "https://") == 0);
 }
+
+// Literal substitutions for one response. YouTube's pre-roll keys are short,
+// so a request holds only a handful of these.
+struct BodyReplacement {
+  std::string from;
+  std::string to;
+};
+
+std::vector<BodyReplacement> ParseReplacements(const std::string& text) {
+  std::vector<BodyReplacement> out;
+  if (text.empty())
+    return out;
+  size_t index = 0;
+  auto read_line = [&](std::string* line) -> bool {
+    if (index >= text.size())
+      return false;
+    size_t end = text.find('\n', index);
+    if (end == std::string::npos)
+      return false;
+    *line = text.substr(index, end - index);
+    index = end + 1;
+    return true;
+  };
+  auto read_bytes = [&](size_t size, std::string* bytes) -> bool {
+    if (size > text.size() - index)
+      return false;
+    *bytes = text.substr(index, size);
+    index += size;
+    return true;
+  };
+  try {
+    std::string count_line;
+    if (!read_line(&count_line))
+      return {};
+    int count = std::stoi(count_line);
+    if (count < 0 || count > 32)
+      return {};
+    for (int n = 0; n < count; ++n) {
+      std::string from_line;
+      std::string to_line;
+      std::string from;
+      std::string to;
+      if (!read_line(&from_line))
+        return {};
+      size_t from_size = static_cast<size_t>(std::stoul(from_line));
+      if (!read_bytes(from_size, &from) || !read_line(&to_line))
+        return {};
+      size_t to_size = static_cast<size_t>(std::stoul(to_line));
+      if (!read_bytes(to_size, &to))
+        return {};
+      if (!from.empty() && from.size() <= 256 && to.size() <= 256)
+        out.push_back(BodyReplacement{std::move(from), std::move(to)});
+    }
+  } catch (...) {
+    return {};
+  }
+  return out;
+}
+
+bool BinaryMime(const std::string& mime) {
+  return mime.rfind("image/", 0) == 0 || mime.rfind("video/", 0) == 0 ||
+         mime.rfind("audio/", 0) == 0 || mime.rfind("font/", 0) == 0 ||
+         mime == "application/octet-stream" || mime == "application/wasm";
+}
+
+// Streaming literal replace. A needle that straddles two chunks stays in
+// `pending` until the next chunk, or until `flush` at the end of the body.
+// Needles are applied leftmost, longest first, and the replacement is not
+// searched again.
+void StreamReplace(const std::string& chunk,
+                   bool flush,
+                   const std::vector<BodyReplacement>& replacements,
+                   std::string* pending,
+                   std::string* produced) {
+  std::string work = *pending;
+  work.append(chunk);
+  size_t max_len = 1;
+  for (const auto& replacement : replacements)
+    max_len = std::max(max_len, replacement.from.size());
+  size_t limit = work.size();
+  if (!flush)
+    limit = work.size() > max_len - 1 ? work.size() - (max_len - 1) : 0;
+  size_t cursor = 0;
+  size_t index = 0;
+  std::string out;
+  while (index < limit) {
+    const BodyReplacement* hit = nullptr;
+    for (const auto& replacement : replacements) {
+      if (replacement.from.empty() || index + replacement.from.size() > work.size())
+        continue;
+      if (work.compare(index, replacement.from.size(), replacement.from) == 0 &&
+          (!hit || replacement.from.size() > hit->from.size()))
+        hit = &replacement;
+    }
+    if (hit) {
+      out.append(work, cursor, index - cursor);
+      out.append(hit->to);
+      index += hit->from.size();
+      cursor = index;
+    } else {
+      ++index;
+    }
+  }
+  size_t emitted = cursor > limit ? cursor : limit;
+  if (cursor < emitted)
+    out.append(work, cursor, emitted - cursor);
+  *pending = work.substr(emitted);
+  produced->append(out);
+}
+
+// Rewrites a response the way Firefox's filterResponseData does for `$replace`.
+// The player then parses JSON that has no ad-placement keys.
+class BodyReplaceFilter : public CefResponseFilter {
+ public:
+  explicit BodyReplaceFilter(std::vector<BodyReplacement> replacements)
+      : replacements_(std::move(replacements)) {}
+
+  bool InitFilter() override { return !replacements_.empty(); }
+
+  FilterStatus Filter(void* data_in,
+                      size_t data_in_size,
+                      size_t& data_in_read,
+                      void* data_out,
+                      size_t data_out_size,
+                      size_t& data_out_written) override {
+    if (!data_out || data_out_size == 0)
+      return RESPONSE_FILTER_ERROR;
+    // A full output buffer makes the wrapper call again with an empty input.
+    // That call is not the end of the body. The end is an empty call that was
+    // not asked for that way, which is when the pending tail has to be emitted.
+    bool continuation = continuation_;
+    continuation_ = false;
+    bool end = data_in_size == 0 && !continuation;
+    data_in_read = data_in_size;
+    if (data_in_size > 0 && data_in) {
+      StreamReplace(std::string(static_cast<char*>(data_in), data_in_size), false,
+                    replacements_, &pending_, &overflow_);
+    } else if (end) {
+      StreamReplace("", true, replacements_, &pending_, &overflow_);
+    }
+    size_t written = std::min(overflow_.size(), data_out_size);
+    if (written > 0) {
+      std::memcpy(data_out, overflow_.data(), written);
+      overflow_.erase(0, written);
+    }
+    data_out_written = written;
+    bool full = written == data_out_size;
+    if (!overflow_.empty() && full) {
+      continuation_ = true;
+      return RESPONSE_FILTER_NEED_MORE_DATA;
+    }
+    if (!end && !pending_.empty())
+      return RESPONSE_FILTER_NEED_MORE_DATA;
+    if (!overflow_.empty())
+      return RESPONSE_FILTER_NEED_MORE_DATA;
+    return RESPONSE_FILTER_DONE;
+  }
+
+ private:
+  std::vector<BodyReplacement> replacements_;
+  std::string pending_;
+  std::string overflow_;
+  bool continuation_ = false;
+
+  IMPLEMENT_REFCOUNTING(BodyReplaceFilter);
+};
 
 // Returns true when the request should be cancelled. CSS is filled for every
 // call that reaches Lisp, including an empty sheet, so a later navigation can
@@ -1179,6 +1380,7 @@ class Client : public CefClient,
     job->url = url;
     job->document_url = DocumentUrl(request, frame);
     job->type = type;
+    job->id = request->GetIdentifier();
     job->async = callback;
     {
       std::lock_guard<std::mutex> lock(g_request_mu);
@@ -1189,6 +1391,41 @@ class Client : public CefClient,
     g_request_cv.notify_one();
     ArmRequestTimeout(job);
     return RV_CONTINUE_ASYNC;
+  }
+
+  CefRefPtr<CefResponseFilter> GetResourceResponseFilter(
+      CefRefPtr<CefBrowser> browser,
+      CefRefPtr<CefFrame> frame,
+      CefRefPtr<CefRequest> request,
+      CefRefPtr<CefResponse> response) override {
+    (void)browser;
+    (void)frame;
+    if (!request)
+      return nullptr;
+    auto replacements = ParseReplacements(ReplacementsText(request->GetIdentifier()));
+    if (replacements.empty())
+      return nullptr;
+    std::string mime = response ? response->GetMimeType().ToString() : std::string();
+    for (char& character : mime)
+      character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    if (BinaryMime(mime))
+      return nullptr;
+    return new BodyReplaceFilter(std::move(replacements));
+  }
+
+  void OnResourceLoadComplete(CefRefPtr<CefBrowser> browser,
+                              CefRefPtr<CefFrame> frame,
+                              CefRefPtr<CefRequest> request,
+                              CefRefPtr<CefResponse> response,
+                              URLRequestStatus status,
+                              int64_t received_content_length) override {
+    (void)browser;
+    (void)frame;
+    (void)response;
+    (void)status;
+    (void)received_content_length;
+    if (request)
+      ForgetReplacements(request->GetIdentifier());
   }
 
   void OnResourceRedirect(CefRefPtr<CefBrowser> browser,
@@ -1521,11 +1758,21 @@ void cl_cef_scheme_stop(void) {
   g_scheme_cv.notify_all();
 }
 
-void cl_cef_request_decision_set(cl_cef_request_decision* decision, int block, const char* css) {
+void cl_cef_request_decision_set(cl_cef_request_decision* decision,
+                                 int block,
+                                 const char* css) {
   if (!decision)
     return;
   decision->block = block ? 1 : 0;
   decision->css = css ? css : "";
+  decision->replacements.clear();
+}
+
+void cl_cef_request_decision_replace(cl_cef_request_decision* decision,
+                                     const char* replacements) {
+  if (!decision)
+    return;
+  decision->replacements = replacements ? replacements : "";
 }
 
 void cl_cef_set_request_callback(cl_cef_request_callback callback) {
@@ -1551,6 +1798,7 @@ int cl_cef_request_pump(void) {
     } catch (...) {
       job->decision.block = 0;
       job->decision.css.clear();
+      job->decision.replacements.clear();
     }
   }
   if (job) {
@@ -1558,6 +1806,7 @@ int cl_cef_request_pump(void) {
       FinishRequest(job);
     } catch (...) {
       job->decision.block = 0;
+      job->decision.replacements.clear();
       if (!job->settled.load())
         FinishRequest(job);
     }

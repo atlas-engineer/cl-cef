@@ -69,6 +69,10 @@
   (block :int)
   (css :string))
 
+(defcef "cl_cef_request_decision_replace" :void
+  (decision :pointer)
+  (replacements :string))
+
 (defcef "cl_cef_set_request_callback" :void
   (callback :pointer))
 
