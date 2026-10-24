@@ -5,10 +5,12 @@
 #
 #   cmake -S ~/Source/Lisp/cl-cef -B ~/Source/Lisp/cl-cef/build -DCEF_ROOT=/path/to/cef_binary
 #   cmake --build ~/Source/Lisp/cl-cef/build
+#   cmake --install ~/Source/Lisp/cl-cef/build --prefix ~/.local
 #
 # CEF_ROOT is the directory that contains include/, Release/, and cmake/.
 # CEF 124 or newer is required. The build produces libcl-cef.so and
 # cl-cef-helper next to the CEF resources the helper needs at runtime.
+# Install copies only libcl-cef.so. It keeps loading libcef.so from CEF_ROOT.
 
 cmake_minimum_required(VERSION 3.19)
 project(cl-cef LANGUAGES C CXX)
@@ -23,6 +25,7 @@ endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CEF_ROOT}/cmake")
 find_package(CEF REQUIRED)
+include(GNUInstallDirs)
 
 add_subdirectory(${CEF_LIBCEF_DLL_WRAPPER_PATH} libcef_dll_wrapper)
 
@@ -41,9 +44,13 @@ target_include_directories(cl-cef PRIVATE "${CEF_ROOT}" "${CMAKE_CURRENT_SOURCE_
 add_dependencies(cl-cef libcef_dll_wrapper)
 target_link_libraries(cl-cef PRIVATE libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
 set_target_properties(cl-cef PROPERTIES
-  BUILD_RPATH "$ORIGIN"
-  INSTALL_RPATH "$ORIGIN"
+  BUILD_RPATH "$ORIGIN;${CEF_BINARY_DIR_RELEASE}"
+  INSTALL_RPATH "$ORIGIN;${CEF_BINARY_DIR_RELEASE}"
   OUTPUT_NAME "cl-cef")
+
+install(TARGETS cl-cef
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 add_executable(cl-cef-helper source/cxx/helper.cc source/cxx/schemes.hh)
 target_compile_features(cl-cef-helper PRIVATE cxx_std_20)
