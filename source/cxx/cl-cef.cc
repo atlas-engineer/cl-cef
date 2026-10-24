@@ -12,6 +12,8 @@
 #include "include/cef_app.h"
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
+#include "include/cef_command_handler.h"
+#include "include/cef_command_ids.h"
 #include "include/cef_parser.h"
 #include "include/cef_response_filter.h"
 #include "include/base/cef_build.h"
@@ -1124,6 +1126,7 @@ class Client : public CefClient,
                public CefLoadHandler,
                public CefDisplayHandler,
                public CefKeyboardHandler,
+               public CefCommandHandler,
                public CefRequestHandler,
                public CefResourceRequestHandler,
                public CefDownloadHandler,
@@ -1142,6 +1145,7 @@ class Client : public CefClient,
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
+  CefRefPtr<CefCommandHandler> GetCommandHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
@@ -1304,6 +1308,33 @@ class Client : public CefClient,
              (fullscreen ? "true}" : "false}"));
   }
 
+  // Ctrl+K and Ctrl+L focus a toolbar this Chrome window does not have.
+  // The default command destroys a panel whose delegate is already gone, and
+  // CefViewView's destructor then CHECKs on the UI thread.
+  bool OnChromeCommand(CefRefPtr<CefBrowser> browser,
+                       int command_id,
+                       cef_window_open_disposition_t disposition) override {
+    (void)browser;
+    (void)disposition;
+    switch (command_id) {
+      case IDC_FOCUS_TOOLBAR:
+      case IDC_FOCUS_LOCATION:
+      case IDC_FOCUS_SEARCH:
+      case IDC_FOCUS_MENU_BAR:
+      case IDC_FOCUS_BOOKMARKS:
+      case IDC_FOCUS_NEXT_PANE:
+      case IDC_FOCUS_PREVIOUS_PANE:
+      case IDC_FOCUS_WEB_CONTENTS_PANE:
+      case IDC_FOCUS_INACTIVE_POPUP_FOR_ACCESSIBILITY:
+      case IDC_FOCUS_THIS_TAB:
+      case IDC_FOCUS_NEXT_TAB_GROUP:
+      case IDC_FOCUS_PREV_TAB_GROUP:
+        return true;
+      default:
+        return false;
+    }
+  }
+
   bool OnPreKeyEvent(CefRefPtr<CefBrowser> browser,
                      const CefKeyEvent& event,
                      CefEventHandle os_event,
@@ -1328,6 +1359,20 @@ class Client : public CefClient,
             ",\"alt\":" + ((event.modifiers & EVENTFLAG_ALT_DOWN) ? "true" : "false") +
             ",\"meta\":" + ((event.modifiers & EVENTFLAG_COMMAND_DOWN) ? "true" : "false") + "}");
     return consumed != 0;
+  }
+
+  // Called after the page has seen the key. Chrome then runs browser
+  // accelerators. Ctrl+K focuses a toolbar this window does not have, and
+  // that destroys a panel whose delegate is already gone.
+  bool OnKeyEvent(CefRefPtr<CefBrowser> browser,
+                  const CefKeyEvent& event,
+                  CefEventHandle os_event) override {
+    (void)browser;
+    (void)os_event;
+    if (event.type != KEYEVENT_RAWKEYDOWN)
+      return false;
+    return (event.modifiers & (EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN |
+                               EVENTFLAG_COMMAND_DOWN)) != 0;
   }
 
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser,
