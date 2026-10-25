@@ -27,7 +27,15 @@ string.")
     :reader t
     :documentation "Use Alloy style. A Chrome window can host one Chrome view
 and any number of Alloy views, which is how the status and prompt panels share
-the window with the page."))
+the window with the page.")
+   (isolated-context-p
+    nil
+    :type boolean
+    :export t
+    :reader t
+    :documentation "Use a request context that does not share site zoom.
+The profile stores a zoom for about:blank. Panel documents are about:blank, so
+they would render at that zoom."))
   (:export-class-name-p t)
   (:export-predicate-name-p t)
   (:export-accessor-names-p t)
@@ -39,7 +47,9 @@ the window with the page."))
       "about:blank"))
 
 (defun install-native-view (view url)
-  (let ((id (cl-cef-view-create (view-url-string url) (if (alloy-p view) 1 0))))
+  (let ((id (cl-cef-view-create (view-url-string url)
+                                (if (alloy-p view) 1 0)
+                                (if (isolated-context-p view) 1 0))))
     (unless (plusp id)
       (error "CEF failed to create a view."))
     (setf (slot-value view 'id) id)

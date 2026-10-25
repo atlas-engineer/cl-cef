@@ -183,7 +183,8 @@
 
 (defcef "cl_cef_view_create" :int
   (url :string)
-  (alloy :int))
+  (alloy :int)
+  (isolated :int))
 
 (defcef "cl_cef_view_destroy" :void
   (id :int))

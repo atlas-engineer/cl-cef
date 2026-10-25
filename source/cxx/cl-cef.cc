@@ -225,6 +225,9 @@ struct ViewRecord {
   // whatever the bars do not use. Browser views otherwise prefer a window-sized
   // rectangle, which is why the status text (sized in vh) became huge.
   bool bar = false;
+  // Status, message, and prompt documents are about:blank. The shared context
+  // remembers a zoom for that URL, and every about:blank view inherits it.
+  bool isolated = false;
   int bar_height = 0;
   bool flex_set = false;
   // Set while this view is being destroyed. DoClose uses it to close the
@@ -1435,6 +1438,10 @@ class Client : public CefClient,
     }
     view->browser = browser;
     g_browser_to_view[browser->GetIdentifier()] = view_id_;
+    // Level 0 is 100%. SetZoomLevel(0) asks for the context default, which is
+    // 100% in a context that has no stored about:blank zoom.
+    if (view->isolated)
+      browser->GetHost()->SetZoomLevel(0.0);
     // Delete can win the race against creation. Close now that a browser
     // exists; DropView runs from OnBrowserDestroyed.
     if (view->destroying) {
@@ -2624,10 +2631,11 @@ void cl_cef_window_remove_view(int window_id, int view_id) {
   });
 }
 
-int cl_cef_view_create(const char* url, int alloy) {
+int cl_cef_view_create(const char* url, int alloy, int isolated) {
   int id = AllocateId();
   auto record = std::make_shared<ViewRecord>();
   record->id = id;
+  record->isolated = isolated != 0;
   {
     std::lock_guard<std::mutex> lock(g_mu);
     g_views[id] = record;
@@ -2643,7 +2651,8 @@ int cl_cef_view_create(const char* url, int alloy) {
     browser_settings.webgl = STATE_ENABLED;
     CefRefPtr<Client> client = new Client(id);
     record->widget = CefBrowserView::CreateBrowserView(
-        client, initial, browser_settings, nullptr, nullptr,
+        client, initial, browser_settings, nullptr,
+        record->isolated ? record->context : nullptr,
         new BrowserViewDelegate(style, id));
   });
   if (!record->widget) {

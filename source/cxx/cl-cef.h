@@ -140,7 +140,7 @@ void cl_cef_window_add_view(int window_id, int view_id);
 void cl_cef_window_add_view_at(int window_id, int view_id, int index);
 void cl_cef_window_remove_view(int window_id, int view_id);
 
-int cl_cef_view_create(const char* url, int alloy);
+int cl_cef_view_create(const char* url, int alloy, int isolated);
 void cl_cef_view_destroy(int id);
 void cl_cef_view_set_bar_height(int id, int height);
 void cl_cef_view_set_bounds(int id, int x, int y, int width, int height);
