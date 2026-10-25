@@ -220,6 +220,9 @@ struct ViewRecord {
   // Set while this view is being destroyed. DoClose uses it to close the
   // browser without also closing the window that hosts the other views.
   bool destroying = false;
+  // CloseBrowser has been asked. A later turn must not drop the view out
+  // from under that close.
+  bool close_started = false;
   int cookie_policy = 0;
   int next_script_id = 1;
   int next_css_id = 1;
@@ -374,6 +377,27 @@ std::shared_ptr<ViewRecord> FindView(int id) {
   return found == g_views.end() ? nullptr : found->second;
 }
 
+// Release the native view. The CefBrowserView has to outlive its browser:
+// dropping it while the browser is still closing runs ~CefViewView, which
+// CHECKs on the UI thread. Call this from OnBrowserDestroyed, after close.
+void DropView(const std::shared_ptr<ViewRecord>& record) {
+  if (!record)
+    return;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto found = g_views.find(record->id);
+    if (found == g_views.end() || found->second.get() != record.get())
+      return;
+    g_views.erase(found);
+  }
+  record->pending.clear();
+  record->browser = nullptr;
+  record->devtools_registration = nullptr;
+  record->devtools_observer = nullptr;
+  record->widget = nullptr;
+  record->context = nullptr;
+}
+
 std::shared_ptr<WindowRecord> FindWindow(int id) {
   std::lock_guard<std::mutex> lock(g_mu);
   auto found = g_windows.find(id);
@@ -387,7 +411,9 @@ int AllocateId() {
 
 void WithBrowser(const std::shared_ptr<ViewRecord>& view,
                  const std::function<void(CefRefPtr<CefBrowser>)>& fn) {
-  if (!view)
+  // A view being destroyed must not queue work that runs against a browser
+  // that is about to close.
+  if (!view || view->destroying)
     return;
   if (view->browser)
     fn(view->browser);
@@ -1159,11 +1185,28 @@ class Client : public CefClient,
   }
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
-    auto view = FindView(view_id_);
-    if (!view || !browser)
+    if (!browser)
       return;
+    auto view = FindView(view_id_);
+    // The view was dropped while creation was in flight. Close the browser
+    // without the window: DoClose treats a missing view as already detached.
+    if (!view) {
+      browser->GetHost()->CloseBrowser(true);
+      return;
+    }
     view->browser = browser;
     g_browser_to_view[browser->GetIdentifier()] = view_id_;
+    // Delete can win the race against creation. Close now that a browser
+    // exists; DropView runs from OnBrowserDestroyed.
+    if (view->destroying) {
+      view->pending.clear();
+      if (!view->close_started) {
+        view->close_started = true;
+        browser->GetHost()->SetAudioMuted(true);
+        browser->GetHost()->CloseBrowser(true);
+      }
+      return;
+    }
     auto pending = std::move(view->pending);
     view->pending.clear();
     // These run while the view is being attached. Calling them inline re-enters
@@ -1211,7 +1254,9 @@ class Client : public CefClient,
   bool DoClose(CefRefPtr<CefBrowser> browser) override {
     (void)browser;
     auto view = FindView(view_id_);
-    return view && view->destroying;
+    // A missing view was already removed from the window. Returning false
+    // would close that window and every other view it still holds.
+    return !view || view->destroying;
   }
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
@@ -1245,6 +1290,8 @@ class Client : public CefClient,
     if (!frame)
       return;
     auto view = FindView(view_id_);
+    if (!view || view->destroying)
+      return;
     ApplyScripts(view, frame, true);
     std::string cosmetic = CosmeticFor(frame->GetURL().ToString());
     if (!cosmetic.empty())
@@ -1263,6 +1310,8 @@ class Client : public CefClient,
     if (!frame)
       return;
     auto view = FindView(view_id_);
+    if (!view || view->destroying)
+      return;
     ApplyScripts(view, frame, false);
     if (!frame->IsMain())
       return;
@@ -1278,6 +1327,9 @@ class Client : public CefClient,
     (void)browser;
     if (!frame || !frame->IsMain())
       return;
+    auto view = FindView(view_id_);
+    if (!view || view->destroying)
+      return;
     Emit(view_id_,
          "{\"event\":\"did-fail-load\",\"url\":" + JsonString(failed_url.ToString()) +
              ",\"errorCode\":" + std::to_string(static_cast<int>(error_code)) +
@@ -1290,14 +1342,18 @@ class Client : public CefClient,
     (void)browser;
     if (!frame || !frame->IsMain())
       return;
+    auto view = FindView(view_id_);
+    if (!view || view->destroying)
+      return;
     Emit(view_id_, "{\"event\":\"address-change\",\"url\":" + JsonString(url.ToString()) + "}");
   }
 
   void OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString& title) override {
     (void)browser;
     auto view = FindView(view_id_);
-    if (view)
-      view->title = title.ToString();
+    if (!view || view->destroying)
+      return;
+    view->title = title.ToString();
     Emit(view_id_, "{\"event\":\"page-title-updated\",\"title\":" + JsonString(title.ToString()) + "}");
   }
 
@@ -1628,6 +1684,20 @@ class BrowserViewDelegate : public CefBrowserViewDelegate {
     if (!record || !record->bar)
       return 0;
     return record->bar_height;
+  }
+
+  // Runs before OnBeforeClose. The browser is done; the view reference has to
+  // be dropped after this callback returns, or the delegate is destroyed
+  // while it is still on the stack.
+  void OnBrowserDestroyed(CefRefPtr<CefBrowserView> browser_view,
+                          CefRefPtr<CefBrowser> browser) override {
+    (void)browser_view;
+    (void)browser;
+    auto record = FindView(view_id_);
+    if (!record)
+      return;
+    record->browser = nullptr;
+    CefPostTask(TID_UI, new ClosureTask([record]() { DropView(record); }));
   }
 
  private:
@@ -2194,24 +2264,48 @@ void cl_cef_view_destroy(int id) {
   auto record = FindView(id);
   if (!record)
     return;
-  // CefRefPtrs have to be released on the UI thread. Releasing them from the
-  // caller leaks the browser, so a deleted buffer keeps playing audio.
-  CallUI([record, id]() {
+  // CefRefPtrs have to be released on the UI thread. Releasing the browser
+  // view here, before CloseBrowser has destroyed the browser, hits
+  // ~CefViewView's CHECK. OnBrowserDestroyed drops the view once that is done.
+  // A browser that is still being created is closed from OnAfterCreated.
+  CallUI([record]() {
+    if (record->destroying)
+      return;
     record->destroying = true;
-    if (record->browser)
-      record->browser->GetHost()->SetAudioMuted(true);
+    record->pending.clear();
+    CefRefPtr<CefBrowser> browser = record->browser;
+    if (!browser && record->widget)
+      browser = record->widget->GetBrowser();
     if (record->widget) {
       if (CefRefPtr<CefView> parent = record->widget->GetParentView()) {
         if (auto panel = parent->AsPanel())
           panel->RemoveChildView(record->widget);
       }
     }
-    if (record->browser)
-      record->browser->GetHost()->CloseBrowser(true);
-    record->widget = nullptr;
-    record->browser = nullptr;
-    std::lock_guard<std::mutex> lock(g_mu);
-    g_views.erase(id);
+    if (browser) {
+      record->browser = browser;
+      record->close_started = true;
+      browser->GetHost()->SetAudioMuted(true);
+      browser->GetHost()->CloseBrowser(true);
+      return;
+    }
+    // Creation has not reported a browser yet. Give OnAfterCreated one turn,
+    // then drop the view if none appeared.
+    CefPostTask(TID_UI, new ClosureTask([record]() {
+                  if (record->close_started)
+                    return;
+                  CefRefPtr<CefBrowser> late = record->browser;
+                  if (!late && record->widget)
+                    late = record->widget->GetBrowser();
+                  if (late) {
+                    record->browser = late;
+                    record->close_started = true;
+                    late->GetHost()->SetAudioMuted(true);
+                    late->GetHost()->CloseBrowser(true);
+                    return;
+                  }
+                  DropView(record);
+                }));
   });
 }
 
