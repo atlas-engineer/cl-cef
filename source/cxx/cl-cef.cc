@@ -49,7 +49,17 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <dirent.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <sys/prctl.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+// X.h defines this as 0, which breaks CefCallback::Success.
+#undef Success
 #endif
 
 struct cl_cef_response {
@@ -252,6 +262,14 @@ CefRefPtr<CefMenuModel> g_menu;
 std::atomic<cl_cef_event_callback> g_event_cb{nullptr};
 std::atomic<cl_cef_scheme_callback> g_scheme_cb{nullptr};
 std::atomic<bool> g_initialized{false};
+std::atomic<bool> g_quitting{false};
+std::atomic<bool> g_loop_done{false};
+// Browsers still alive. Released on the UI thread, before CefShutdown.
+std::mutex g_browser_mu;
+std::vector<CefRefPtr<CefBrowser>> g_browsers;
+// True while CloseBrowser is running, so a synchronous OnBeforeClose does not
+// quit the message loop before the rest of the browsers are closed.
+bool g_closing_browsers = false;
 
 // Scheme handlers are entered on CEF's IO thread, which is not a Lisp thread.
 // The request is queued and continued later. Waiting here blocks every other
@@ -1147,6 +1165,217 @@ bool ConsultBlocker(const std::string& url,
   return job->decision.block != 0;
 }
 
+void TrackBrowser(const CefRefPtr<CefBrowser>& browser) {
+  if (!browser)
+    return;
+  std::lock_guard<std::mutex> lock(g_browser_mu);
+  for (const auto& existing : g_browsers) {
+    if (existing && existing->IsSame(browser))
+      return;
+  }
+  g_browsers.push_back(browser);
+}
+
+void UntrackBrowser(const CefRefPtr<CefBrowser>& browser) {
+  std::lock_guard<std::mutex> lock(g_browser_mu);
+  g_browsers.erase(std::remove_if(g_browsers.begin(), g_browsers.end(),
+                                  [&](const CefRefPtr<CefBrowser>& existing) {
+                                    return !existing || (browser && existing->IsSame(browser));
+                                  }),
+                   g_browsers.end());
+}
+
+bool BrowsersOpen() {
+  std::lock_guard<std::mutex> lock(g_browser_mu);
+  return !g_browsers.empty();
+}
+
+// Views that have not reported a browser yet must keep the loop alive, or the
+// browser is created after CefShutdown and its process is orphaned.
+bool ViewsAwaitingBrowser() {
+  std::lock_guard<std::mutex> lock(g_mu);
+  for (const auto& entry : g_views) {
+    const auto& view = entry.second;
+    if (view && !view->close_started)
+      return true;
+  }
+  return false;
+}
+
+void MaybeFinishShutdown() {
+  if (!g_quitting.load() || g_closing_browsers || g_loop_done.load())
+    return;
+  if (BrowsersOpen() || ViewsAwaitingBrowser())
+    return;
+  // DropView is posted from OnBrowserDestroyed. Quitting on the next turn lets
+  // that release finish before CefShutdown.
+  CefPostTask(TID_UI, new ClosureTask([] {
+                if (g_loop_done.load() || !g_quitting.load())
+                  return;
+                if (BrowsersOpen() || ViewsAwaitingBrowser())
+                  return;
+                CefQuitMessageLoop();
+              }));
+}
+
+#if defined(__linux__)
+// Chrome-style windows register with the desktop as Chromium. The class has
+// to be nyxt so the application list uses the Nyxt desktop entry, and the
+// native window has to be unmapped as soon as quit starts. CefWindow::Close
+// finishes later, on the message loop, which a REPL does not exit.
+void ForEachAncestor(CefWindowHandle handle, void (*visit)(Display*, Window)) {
+  if (!handle || !visit)
+    return;
+  Display* display = XOpenDisplay(nullptr);
+  if (!display)
+    return;
+  Window window = handle;
+  for (int hop = 0; hop < 8; ++hop) {
+    visit(display, window);
+    Window root = 0;
+    Window parent = 0;
+    Window* children = nullptr;
+    unsigned count = 0;
+    if (!XQueryTree(display, window, &root, &parent, &children, &count))
+      break;
+    if (children)
+      XFree(children);
+    if (!parent || parent == root)
+      break;
+    window = parent;
+  }
+  XFlush(display);
+  XCloseDisplay(display);
+}
+
+void SetNyxtClass(Display* display, Window window) {
+  XClassHint hint;
+  hint.res_name = const_cast<char*>("nyxt");
+  hint.res_class = const_cast<char*>("Nyxt");
+  XSetClassHint(display, window, &hint);
+}
+
+void UnmapNative(Display* display, Window window) { XUnmapWindow(display, window); }
+
+void NameNativeWindow(CefRefPtr<CefWindow> window) {
+  if (window)
+    ForEachAncestor(window->GetWindowHandle(), SetNyxtClass);
+}
+
+void UnmapNativeWindow(CefRefPtr<CefWindow> window) {
+  if (window)
+    ForEachAncestor(window->GetWindowHandle(), UnmapNative);
+}
+#else
+void NameNativeWindow(CefRefPtr<CefWindow> window) { (void)window; }
+void UnmapNativeWindow(CefRefPtr<CefWindow> window) { (void)window; }
+#endif
+
+void CloseTrackedBrowsers() {
+  g_closing_browsers = true;
+  std::vector<CefRefPtr<CefBrowser>> browsers;
+  {
+    std::lock_guard<std::mutex> lock(g_browser_mu);
+    browsers = g_browsers;
+  }
+  std::vector<std::shared_ptr<ViewRecord>> views;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const auto& entry : g_views)
+      views.push_back(entry.second);
+  }
+  for (const auto& view : views) {
+    if (!view)
+      continue;
+    view->destroying = true;
+    view->pending.clear();
+    CefRefPtr<CefBrowser> browser = view->browser;
+    if (!browser && view->widget)
+      browser = view->widget->GetBrowser();
+    if (!browser)
+      continue;
+    view->browser = browser;
+    view->close_started = true;
+    browsers.push_back(browser);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const auto& entry : g_windows)
+      if (entry.second)
+        UnmapNativeWindow(entry.second->window);
+  }
+  for (const auto& browser : browsers) {
+    if (!browser || !browser->GetHost())
+      continue;
+    browser->GetHost()->SetAudioMuted(true);
+    browser->GetHost()->CloseBrowser(true);
+  }
+  g_closing_browsers = false;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const auto& entry : g_views) {
+      if (entry.second)
+        entry.second->close_started = true;
+    }
+  }
+  // Release the CEF objects on the next turn, while the loop can still run
+  // their destructors. Releasing them after the loop returns deadlocks, and
+  // leaving them for CefShutdown destroys an observer list that is not empty.
+  CefPostTask(TID_UI, new ClosureTask([] {
+                if (g_loop_done.load())
+                  return;
+                g_menu = nullptr;
+                {
+                  std::lock_guard<std::mutex> lock(g_browser_mu);
+                  g_browsers.clear();
+                }
+                {
+                  std::lock_guard<std::mutex> lock(g_mu);
+                  for (auto& entry : g_views) {
+                    if (!entry.second)
+                      continue;
+                    entry.second->pending.clear();
+                    entry.second->browser = nullptr;
+                    entry.second->widget = nullptr;
+                    entry.second->context = nullptr;
+                    entry.second->devtools_observer = nullptr;
+                    entry.second->devtools_registration = nullptr;
+                  }
+                  g_views.clear();
+                  for (auto& entry : g_windows) {
+                    if (!entry.second)
+                      continue;
+                    entry.second->window = nullptr;
+                    entry.second->delegate = nullptr;
+                    entry.second->layout = nullptr;
+                  }
+                  g_windows.clear();
+                }
+                CefQuitMessageLoop();
+              }));
+}
+
+void BeginShutdown() {
+  if (!g_initialized.load())
+    return;
+  bool already = false;
+  if (!g_quitting.compare_exchange_strong(already, true))
+    return;
+  std::fprintf(stderr, "cl-cef prepare shutdown\n");
+  std::fflush(stderr);
+  // CloseBrowser can stall. Quit anyway so the process is not stuck.
+  std::thread([] {
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    if (!g_quitting.load() || g_loop_done.load() || !g_initialized.load())
+      return;
+    PostUI([] {
+      if (!g_loop_done.load())
+        CefQuitMessageLoop();
+    });
+  }).detach();
+  PostUI([] { CloseTrackedBrowsers(); });
+}
+
 class Client : public CefClient,
                public CefLifeSpanHandler,
                public CefLoadHandler,
@@ -1187,10 +1416,20 @@ class Client : public CefClient,
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     if (!browser)
       return;
+    TrackBrowser(browser);
     auto view = FindView(view_id_);
     // The view was dropped while creation was in flight. Close the browser
     // without the window: DoClose treats a missing view as already detached.
-    if (!view) {
+    // A shutdown that starts before this callback has to close the browser too,
+    // or the render process outlives Nyxt.
+    if (!view || g_quitting.load()) {
+      if (view) {
+        view->browser = browser;
+        view->destroying = true;
+        view->close_started = true;
+        g_browser_to_view[browser->GetIdentifier()] = view_id_;
+      }
+      browser->GetHost()->SetAudioMuted(true);
       browser->GetHost()->CloseBrowser(true);
       return;
     }
@@ -1251,8 +1490,12 @@ class Client : public CefClient,
 
   // Returning false asks CEF to close the top-level window. That removes the
   // page from the UI and leaves the browser, and its audio, running.
+  // During process shutdown the window is going away too, and returning true
+  // cancels the browser close, so the Chromium processes stay up.
   bool DoClose(CefRefPtr<CefBrowser> browser) override {
     (void)browser;
+    if (g_quitting.load())
+      return false;
     auto view = FindView(view_id_);
     // A missing view was already removed from the window. Returning false
     // would close that window and every other view it still holds.
@@ -1265,11 +1508,16 @@ class Client : public CefClient,
       router_->OnBeforeClose(browser);
     }
     auto view = FindView(view_id_);
-    if (view)
+    if (view) {
       view->browser = nullptr;
-    if (browser)
+      view->close_started = true;
+    }
+    if (browser) {
       g_browser_to_view.erase(browser->GetIdentifier());
+      UntrackBrowser(browser);
+    }
     Emit(view_id_, "{\"event\":\"closed\"}");
+    MaybeFinishShutdown();
   }
 
   void OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
@@ -1780,6 +2028,18 @@ class BrowserApp : public CefApp, public CefBrowserProcessHandler {
 
   CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
 
+  // The browser command line disables the crash handler. Child processes are
+  // launched with it turned back on, and that handler is meant to outlive the
+  // browser, so it is still running after Nyxt has exited.
+  void OnBeforeChildProcessLaunch(CefRefPtr<CefCommandLine> command_line) override {
+    if (!command_line)
+      return;
+    command_line->RemoveSwitch("enable-crash-reporter");
+    command_line->AppendSwitch("disable-breakpad");
+    command_line->AppendSwitch("disable-crash-reporter");
+    command_line->AppendSwitch("disable-in-process-stack-traces");
+  }
+
  private:
   IMPLEMENT_REFCOUNTING(BrowserApp);
 };
@@ -1793,6 +2053,92 @@ void RememberArgs(int argc, char** argv) {
   g_argv.reserve(g_args.size());
   for (std::string& argument : g_args)
     g_argv.push_back(argument.data());
+}
+
+// CefShutdown returns while the helpers are still running when this process
+// stays up, which is what a REPL quit does. The zygote leaves our process
+// group, and a helper whose parent has already exited is reparented to this
+// process (see the child-subreaper set before CefInitialize). Walk that tree
+// and signal it. A second pass catches helpers that get reparented by the
+// first.
+void ReapHelpers() {
+#if !defined(_WIN32)
+  const pid_t self = getpid();
+  for (int pass = 0; pass < 4; ++pass) {
+    std::unordered_map<pid_t, std::vector<pid_t>> children;
+    std::vector<pid_t> helpers;
+    DIR* proc = opendir("/proc");
+    if (!proc)
+      return;
+    while (dirent* entry = readdir(proc)) {
+      if (entry->d_name[0] < '1' || entry->d_name[0] > '9')
+        continue;
+      pid_t pid = static_cast<pid_t>(std::atoi(entry->d_name));
+      if (pid <= 0 || pid == self)
+        continue;
+      std::string dir = std::string("/proc/") + entry->d_name;
+      FILE* status = std::fopen((dir + "/status").c_str(), "r");
+      pid_t parent = 0;
+      if (status) {
+        char line[256];
+        while (std::fgets(line, sizeof line, status)) {
+          if (std::strncmp(line, "PPid:", 5) == 0) {
+            parent = static_cast<pid_t>(std::atoi(line + 5));
+            break;
+          }
+        }
+        std::fclose(status);
+      }
+      if (parent > 0)
+        children[parent].push_back(pid);
+      char exe[4096];
+      ssize_t length = ::readlink((dir + "/exe").c_str(), exe, sizeof exe - 1);
+      bool helper = false;
+      if (length > 0) {
+        exe[length] = '\0';
+        helper = std::strstr(exe, "cl-cef-helper") != nullptr;
+      }
+      if (!helper) {
+        FILE* command = std::fopen((dir + "/cmdline").c_str(), "r");
+        if (command) {
+          char buffer[4096];
+          size_t count = std::fread(buffer, 1, sizeof buffer - 1, command);
+          for (size_t i = 0; i < count; ++i) {
+            if (buffer[i] == '\0')
+              buffer[i] = ' ';
+          }
+          buffer[count] = '\0';
+          helper = std::strstr(buffer, "cl-cef-helper") != nullptr;
+          std::fclose(command);
+        }
+      }
+      if (helper)
+        helpers.push_back(pid);
+    }
+    closedir(proc);
+    std::vector<pid_t> pending{self};
+    std::vector<pid_t> victims;
+    for (size_t index = 0; index < pending.size(); ++index) {
+      auto found = children.find(pending[index]);
+      if (found == children.end())
+        continue;
+      for (pid_t child : found->second) {
+        pending.push_back(child);
+        for (pid_t helper : helpers) {
+          if (helper == child)
+            victims.push_back(child);
+        }
+      }
+    }
+    if (victims.empty())
+      return;
+    for (pid_t pid : victims)
+      ::kill(pid, SIGKILL);
+    for (pid_t pid : victims)
+      ::waitpid(pid, nullptr, WNOHANG);
+    ::usleep(20 * 1000);
+  }
+#endif
 }
 
 }  // namespace
@@ -1981,6 +2327,13 @@ int cl_cef_initialize(int argc,
   if (subprocess >= 0)
     std::_Exit(subprocess);
 
+#if defined(__linux__)
+  // Orphans from the zygote must stay descendants of this process. Otherwise
+  // a REPL quit, which does not exit Lisp, loses them to init and they keep
+  // running.
+  prctl(PR_SET_CHILD_SUBREAPER, 1);
+#endif
+
   CefSettings settings;
   settings.no_sandbox = no_sandbox ? 1 : 0;
   settings.windowless_rendering_enabled = 0;
@@ -2016,9 +2369,12 @@ void cl_cef_run_message_loop(cl_cef_ready_callback ready) {
   if (ready)
     CefPostTask(TID_UI, new ClosureTask([ready]() { ready(); }));
   CefRunMessageLoop();
+  g_loop_done.store(true);
   std::fprintf(stderr, "cl-cef message loop returned\n");
   std::fflush(stderr);
 }
+
+void cl_cef_prepare_shutdown(void) { BeginShutdown(); }
 
 void cl_cef_quit_message_loop(void) {
   std::fprintf(stderr, "cl-cef quit message loop\n");
@@ -2036,10 +2392,16 @@ void cl_cef_post(cl_cef_task_callback callback) {
 }
 
 void cl_cef_shutdown(void) {
-  if (!g_initialized.exchange(false))
-    return;
-  CefShutdown();
+  if (g_initialized.exchange(false)) {
+    // Browsers are already closed. Dropping the view widgets here deadlocks:
+    // their destructors wait on the message loop, which has returned.
+    CefShutdown();
+  }
+  // The helpers outlive CefShutdown when the Lisp process keeps running.
+  ReapHelpers();
 }
+
+void cl_cef_reap_helpers(void) { ReapHelpers(); }
 
 int cl_cef_on_ui_thread(void) { return CefCurrentlyOn(TID_UI) ? 1 : 0; }
 
@@ -2075,6 +2437,7 @@ int cl_cef_window_create(int width, int height, const char* title) {
       record->layout = record->window->SetToBoxLayout(settings);
       record->window->SetTitle(record->title);
       record->window->Show();
+      NameNativeWindow(record->window);
     }
   });
   if (!record->window) {
@@ -2088,8 +2451,10 @@ int cl_cef_window_create(int width, int height, const char* title) {
 void cl_cef_window_close(int id) {
   auto record = FindWindow(id);
   CallUI([&]() {
-    if (record && record->window)
+    if (record && record->window) {
+      UnmapNativeWindow(record->window);
       record->window->Close();
+    }
   });
   std::lock_guard<std::mutex> lock(g_mu);
   g_windows.erase(id);

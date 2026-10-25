@@ -97,12 +97,16 @@
 (defcef "cl_cef_run_message_loop" :void
   (ready :pointer))
 
+(defcef "cl_cef_prepare_shutdown" :void)
+
 (defcef "cl_cef_quit_message_loop" :void)
 
 (defcef "cl_cef_post" :void
   (callback :pointer))
 
 (defcef "cl_cef_shutdown" :void)
+
+(defcef "cl_cef_reap_helpers" :void)
 
 (defcef "cl_cef_on_ui_thread" :int)
 

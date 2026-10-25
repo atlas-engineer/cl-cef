@@ -494,7 +494,33 @@ CEF calls scheme handlers on its IO thread, which cannot enter Lisp.")
     (install-request-blocker))
   #+sbcl
   (pushnew 'terminate sb-ext:*exit-hooks*)
+  #+sbcl
+  (install-exit-signals)
   t)
+
+#+sbcl
+(defun install-exit-signals ()
+  "Run `terminate' when the process is asked to exit.
+An unhandled SIGTERM dies in the kernel. CEF never reaches `CefShutdown', and
+the Chromium subprocesses, which are not in this process group, stay alive."
+  (flet ((shutdown (&rest ignored)
+           (declare (ignore ignored))
+           (request-terminate)))
+    (sb-sys:enable-interrupt sb-unix:sigint #'shutdown)
+    (sb-sys:enable-interrupt sb-unix:sigterm #'shutdown)))
+
+(defvar *terminate-lock* (bt:make-lock "cl-cef-terminate"))
+(defvar *terminate-thread* nil)
+
+(defun request-terminate ()
+  "Start `terminate' unless a shutdown is already in progress.
+Called from a signal, so the work runs on its own thread: the UI thread has to
+get back to the message loop to close browsers."
+  (bt:with-lock-held (*terminate-lock*)
+    (when (and *terminate-thread* (bt:thread-alive-p *terminate-thread*))
+      (return-from request-terminate nil))
+    (setf *terminate-thread*
+          (bt:make-thread #'terminate :name "cl-cef shutdown"))))
 
 (export-always 'join)
 (defun join (&optional (interface *interface*))
@@ -502,13 +528,34 @@ CEF calls scheme handlers on its IO thread, which cannot enter Lisp.")
   (when (and interface (ui-thread interface))
     (bt:join-thread (ui-thread interface))))
 
+(defun reap-helpers ()
+  "Kill Chromium helpers still descended from this process.
+`CefShutdown' leaves them running when Lisp itself stays up."
+  (when *library-loaded-p*
+    (cl-cef-reap-helpers)))
+
 (export-always 'terminate)
 (defun terminate (&optional (interface *interface*))
-  "Quit the CEF message loop. The UI thread shuts CEF down as it exits."
+  "Close CEF browsers and wait until the UI thread has shut Chromium down.
+`CefShutdown' runs on that thread after the message loop returns. Quitting the
+loop while browsers are open leaves the subprocesses alive, so this waits for
+them to close. Helpers that survive that are killed: from a REPL the Lisp
+process stays up, so they would not die with it."
   (unless (and interface (alive-p interface))
+    (reap-helpers)
     (warn "Already terminated, nothing to do.")
     (return-from terminate nil))
   (cl-cef-request-stop)
   (cl-cef-scheme-stop)
-  (cl-cef-quit-message-loop)
+  (cl-cef-prepare-shutdown)
+  (unless (eq (bt:current-thread) (ui-thread interface))
+    #+sbcl
+    (handler-case
+        (sb-ext:with-timeout 10
+          (join interface))
+      (sb-ext:timeout ()
+        (warn "CEF shutdown did not finish; the process will exit anyway.")))
+    #-sbcl
+    (join interface))
+  (reap-helpers)
   t)

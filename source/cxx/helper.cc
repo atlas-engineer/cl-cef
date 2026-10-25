@@ -16,6 +16,12 @@
 
 #include <cstdlib>
 
+#if defined(__linux__)
+#include <csignal>
+#include <sys/prctl.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 const char kInputScript[] = R"JS(
@@ -107,6 +113,13 @@ class HelperApp : public CefApp, public CefRenderProcessHandler {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+#if defined(__linux__)
+  /* The zygote leaves Nyxt's process group, so the signal that kills Nyxt is
+   * not delivered here. SIGKILL cannot be caught: Chromium handles SIGTERM and
+   * would keep running after the parent died. */
+  if (prctl(PR_SET_PDEATHSIG, SIGKILL) == 0 && getppid() == 1)
+    return 0;
+#endif
   cl_cef_note_schemes_from_argv(argc, argv);
   cl_cef_note_schemes_from_user_data(argc, argv);
   CefMainArgs main_args(argc, argv);

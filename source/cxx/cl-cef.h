@@ -109,9 +109,16 @@ int cl_cef_initialize(int argc,
 
 /* Blocks on the calling thread, which becomes the CEF UI thread. */
 void cl_cef_run_message_loop(cl_cef_ready_callback ready);
+/* Close every browser, then quit the message loop once they are gone.
+ * CefShutdown runs on the UI thread after the loop returns. Quitting the loop
+ * while browsers are still open leaves the Chromium subprocesses alive. */
+void cl_cef_prepare_shutdown(void);
 void cl_cef_quit_message_loop(void);
 void cl_cef_post(cl_cef_task_callback callback);
 void cl_cef_shutdown(void);
+/* Kill cl-cef-helper processes descended from this one. CefShutdown leaves
+ * them behind when the Lisp process stays up, as it does from a REPL. */
+void cl_cef_reap_helpers(void);
 int cl_cef_on_ui_thread(void);
 
 void cl_cef_string_free(char* string);
