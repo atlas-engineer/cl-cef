@@ -308,7 +308,9 @@ write barrier, so that handler has to stay disabled."
 
 CALLBACK is called as (callback object data). DATA is an alist decoded from the
 bridge event. A non-nil return value consumes synchronous events such as
-`:before-input-event' and `:window-open'.
+`:before-input-event', `:window-open', and `:open-url-from-tab'.
+`:open-url-from-tab' is a middle-click or Control-click on a link. DATA includes
+`:url' and `:disposition', either \"background-tab\" or \"foreground-tab\".
 
 Callbacks run on the CEF UI thread. They must return without waiting on that
 thread. When ONCE-P is non-nil, CALLBACK is removed after it runs."))

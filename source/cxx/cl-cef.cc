@@ -1679,6 +1679,35 @@ class Client : public CefClient,
                                EVENTFLAG_COMMAND_DOWN)) != 0;
   }
 
+  // Middle-click and Control-click ask for a new tab. This window has no tab
+  // strip. Report the gesture and cancel it. Returning false would navigate
+  // the page that was clicked.
+  bool OnOpenURLFromTab(CefRefPtr<CefBrowser> browser,
+                        CefRefPtr<CefFrame> frame,
+                        const CefString& target_url,
+                        CefRequestHandler::WindowOpenDisposition target_disposition,
+                        bool user_gesture) override {
+    (void)browser;
+    (void)frame;
+    (void)user_gesture;
+    const char* disposition = nullptr;
+    switch (target_disposition) {
+      case CEF_WOD_NEW_BACKGROUND_TAB:
+        disposition = "background-tab";
+        break;
+      case CEF_WOD_NEW_FOREGROUND_TAB:
+        disposition = "foreground-tab";
+        break;
+      default:
+        return false;
+    }
+    int consumed = Emit(view_id_,
+                        std::string("{\"event\":\"open-url-from-tab\",\"url\":") +
+                            JsonString(target_url.ToString()) +
+                            ",\"disposition\":" + JsonString(disposition) + "}");
+    return consumed != 0;
+  }
+
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser,
                       CefRefPtr<CefFrame> frame,
                       CefRefPtr<CefRequest> request,
