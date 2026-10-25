@@ -58,7 +58,7 @@
   (:documentation "Browser-wide session. Downloads are delivered here."))
 
 (defmethod initialize-instance :after ((session session) &key)
-  (setf (slot-value session 'id) +session-object-id+))
+  (setf (slot-value session 'native-id) +session-object-id+))
 
 (export-always 'default-session)
 (defmethod default-session ((interface interface))

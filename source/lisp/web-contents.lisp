@@ -14,7 +14,7 @@
 
 (defmethod initialize-instance :after ((web-contents web-contents) &key id interface)
   (when id
-    (setf (slot-value web-contents 'id) id))
+    (setf (slot-value web-contents 'native-id) id))
   (when interface
     (setf (slot-value web-contents 'interface) interface)))
 

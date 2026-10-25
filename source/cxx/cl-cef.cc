@@ -264,6 +264,9 @@ std::string g_download_directory;
 CefRefPtr<CefMenuModel> g_menu;
 std::atomic<cl_cef_event_callback> g_event_cb{nullptr};
 std::atomic<cl_cef_scheme_callback> g_scheme_cb{nullptr};
+// Names registered with the global request context. An isolated context does
+// not inherit those factories, so a panel view would fail every lisp: fetch.
+std::vector<std::string> g_scheme_names;
 std::atomic<bool> g_initialized{false};
 std::atomic<bool> g_quitting{false};
 std::atomic<bool> g_loop_done{false};
@@ -716,6 +719,18 @@ class SchemeFactory : public CefSchemeHandlerFactory {
   IMPLEMENT_REFCOUNTING(SchemeFactory);
 };
 
+// CONTEXT null registers on the global request context. A panel view passes
+// its own context: that context starts empty, and CefRegisterSchemeHandlerFactory
+// only fills the global one.
+void RegisterSchemeFactories(CefRefPtr<CefRequestContext> context) {
+  for (const auto& name : g_scheme_names) {
+    if (context)
+      context->RegisterSchemeHandlerFactory(name, "", new SchemeFactory(name));
+    else
+      CefRegisterSchemeHandlerFactory(name, "", new SchemeFactory(name));
+  }
+}
+
 class QueryHandler : public CefMessageRouterBrowserSide::Handler {
  public:
   explicit QueryHandler(int view_id) : view_id_(view_id) {}
@@ -751,6 +766,12 @@ class QueryHandler : public CefMessageRouterBrowserSide::Handler {
     return 0;
   }
 
+  static std::string Text(CefRefPtr<CefDictionaryValue> dict, const char* key) {
+    if (!dict || !dict->HasKey(key) || dict->GetType(key) != VTYPE_STRING)
+      return {};
+    return dict->GetString(key).ToString();
+  }
+
   void Handle(const std::string& request) {
     CefRefPtr<CefValue> root = CefParseJSON(request, JSON_PARSER_RFC);
     if (!root || root->GetType() != VTYPE_DICTIONARY)
@@ -764,8 +785,16 @@ class QueryHandler : public CefMessageRouterBrowserSide::Handler {
         ",\"meta\":" + (Flag(dict, "meta") ? "true" : "false") + "}";
     if (kind == "button") {
       int button = dict->GetInt("button") + 1;
+      // Click targets in the status bar. Empty when the page has no marker.
+      std::string marked;
+      std::string action = Text(dict, "action");
+      std::string aux = Text(dict, "aux");
+      if (!action.empty())
+        marked += ",\"action\":" + JsonString(action);
+      if (!aux.empty())
+        marked += ",\"aux\":" + JsonString(aux);
       Emit(view_id_,
-           "{\"event\":\"button-press\",\"button\":" + std::to_string(button) + mods);
+           "{\"event\":\"button-press\",\"button\":" + std::to_string(button) + marked + mods);
     } else if (kind == "wheel") {
       double dx = Number(dict, "dx");
       double dy = Number(dict, "dy");
@@ -2391,8 +2420,10 @@ int cl_cef_initialize(int argc,
     CefString(&settings.user_agent) = user_agent;
   if (!CefInitialize(main_args, settings, app, nullptr))
     return 0;
+  g_scheme_names.clear();
   for (const auto& scheme : cl_cef_parse_schemes(schemes))
-    CefRegisterSchemeHandlerFactory(scheme.name, "", new SchemeFactory(scheme.name));
+    g_scheme_names.push_back(scheme.name);
+  RegisterSchemeFactories(nullptr);
   g_initialized.store(true);
   return 1;
 #endif
@@ -2645,6 +2676,10 @@ int cl_cef_view_create(const char* url, int alloy, int isolated) {
   CallUI([record, initial, id, style]() {
     CefRequestContextSettings context_settings;
     record->context = CefRequestContext::CreateContext(context_settings, nullptr);
+    // The status, message, and prompt views use this context. Their buttons
+    // fetch lisp: URLs, which only resolve where a factory is registered.
+    if (record->isolated)
+      RegisterSchemeFactories(record->context);
     CefBrowserSettings browser_settings;
     browser_settings.javascript = STATE_ENABLED;
     browser_settings.image_loading = STATE_ENABLED;

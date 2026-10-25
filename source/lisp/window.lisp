@@ -35,7 +35,7 @@
   (let ((id (cl-cef-window-create (width window) (height window) (title window))))
     (unless (plusp id)
       (error "CEF failed to create a window."))
-    (setf (slot-value window 'id) id)
+    (setf (slot-value window 'native-id) id)
     (register-object window)))
 
 (export-always 'kill)

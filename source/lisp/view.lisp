@@ -52,7 +52,7 @@ they would render at that zoom."))
                                 (if (isolated-context-p view) 1 0))))
     (unless (plusp id)
       (error "CEF failed to create a view."))
-    (setf (slot-value view 'id) id)
+    (setf (slot-value view 'native-id) id)
     (setf (web-contents view)
           (make-instance 'web-contents :id id :interface (interface view)))
     ;; The view is what Nyxt specializes on, so it wins the id lookup.

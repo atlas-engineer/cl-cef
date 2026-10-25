@@ -114,11 +114,15 @@ The sandbox needs extra setup (chrome-sandbox) that this bridge does not perform
   (:documentation "A running CEF browser process."))
 
 (define-class remote-object ()
-  ((id
+  ;; Bridge id, under its own name. Nyxt's buffer and window each have an
+  ;; ID slot; two slots whose names differ only by package make SBCL warn
+  ;; while the class is finalized, and that warning aborts the command.
+  ;; The reader is still `id'.
+  ((native-id
     0
-    :export t
-    :reader t
-    :writer nil
+    :initarg :id
+    :reader id
+    :export nil
     :type integer
     :documentation "Bridge object id. 0 means the native object was not created.")
    (interface
@@ -133,11 +137,13 @@ The sandbox needs extra setup (chrome-sandbox) that this bridge does not perform
   (:export-accessor-names-p t)
   (:documentation "A CEF object addressed by an integer id."))
 
+(export-always 'id)
+
 (defmethod initialize-instance :after ((object remote-object) &key id interface)
-  ;; `:writer nil' still leaves the initarg, but set the slots explicitly so a
-  ;; caller can force an id such as the session object id.
+  ;; The reader has no writer. Set the slots here so a caller can force an
+  ;; id such as the session object id.
   (when id
-    (setf (slot-value object 'id) id))
+    (setf (slot-value object 'native-id) id))
   (when interface
     (setf (slot-value object 'interface) interface)))
 
