@@ -116,6 +116,14 @@
 (defcef "cl_cef_set_download_directory" :void
   (path :string))
 
+(defcef "cl_cef_add_app_icon_png" :void
+  (scale :float)
+  (png :pointer)
+  (size :unsigned-long))
+
+(defcef "cl_cef_set_window_class" :void
+  (name :string))
+
 (defcef "cl_cef_window_create" :int
   (width :int)
   (height :int)

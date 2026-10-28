@@ -124,6 +124,15 @@ int cl_cef_on_ui_thread(void);
 void cl_cef_string_free(char* string);
 void cl_cef_set_download_directory(const char* path);
 
+/* One PNG representation of the window icon. scale_factor 1 is the base
+ * size; a 32px image of a 16px base is 2. Call before the first window.
+ * A Chrome-style window otherwise advertises the Chromium logo. */
+void cl_cef_add_app_icon_png(float scale_factor, const void* png, size_t size);
+
+/* WM_CLASS resource name and class for windows created afterwards.
+ * Empty leaves Chromium's default. Call before the first window. */
+void cl_cef_set_window_class(const char* name);
+
 int cl_cef_window_create(int width, int height, const char* title);
 void cl_cef_window_close(int id);
 void cl_cef_window_set_title(int id, const char* title);

@@ -58,6 +58,7 @@
 #include <sys/prctl.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Xatom.h>
 // X.h defines this as 0, which breaks CefCallback::Success.
 #undef Success
 #endif
@@ -1250,11 +1251,40 @@ void MaybeFinishShutdown() {
               }));
 }
 
+// Icon bytes and WM_CLASS supplied by the host before the first window. A
+// Chrome-style window otherwise publishes Chromium's product logo and class.
+struct AppIconPng {
+  float scale = 1.f;
+  std::vector<unsigned char> bytes;
+};
+
+std::mutex g_icon_mu;
+std::vector<AppIconPng> g_icon_pngs;
+int g_icon_generation = 0;
+std::string g_window_class;
+
+void RememberAppIcon(float scale, const void* png, size_t size) {
+  if (!png || size == 0 || !(scale > 0.f))
+    return;
+  AppIconPng icon;
+  icon.scale = scale;
+  const auto* data = static_cast<const unsigned char*>(png);
+  icon.bytes.assign(data, data + size);
+  std::lock_guard<std::mutex> lock(g_icon_mu);
+  g_icon_pngs.push_back(std::move(icon));
+  ++g_icon_generation;
+}
+
+void RememberWindowClass(const char* name) {
+  std::lock_guard<std::mutex> lock(g_icon_mu);
+  g_window_class = name ? name : "";
+}
+
 #if defined(__linux__)
-// Chrome-style windows register with the desktop as Chromium. The class has
-// to be nyxt so the application list uses the Nyxt desktop entry, and the
-// native window has to be unmapped as soon as quit starts. CefWindow::Close
-// finishes later, on the message loop, which a REPL does not exit.
+// Chrome-style windows register with the desktop as Chromium. When the host
+// set a class, apply it so the desktop entry matches. The native window also
+// has to be unmapped as soon as quit starts. CefWindow::Close finishes later,
+// on the message loop, which a REPL does not exit.
 void ForEachAncestor(CefWindowHandle handle, void (*visit)(Display*, Window)) {
   if (!handle || !visit)
     return;
@@ -1276,31 +1306,180 @@ void ForEachAncestor(CefWindowHandle handle, void (*visit)(Display*, Window)) {
       break;
     window = parent;
   }
-  XFlush(display);
+  XSync(display, False);
   XCloseDisplay(display);
 }
 
-void SetNyxtClass(Display* display, Window window) {
+struct BuiltIcon {
+  CefRefPtr<CefImage> image;
+  std::vector<unsigned long> property;
+  int generation = -1;
+};
+
+bool& AppIconReleased() {
+  static bool released = false;
+  return released;
+}
+
+BuiltIcon& BuiltAppIcon() {
+  static BuiltIcon built;
+  // Drop the image before CefShutdown. Recreating it afterwards uses a
+  // library that has already been torn down.
+  if (AppIconReleased()) {
+    built.image = nullptr;
+    built.property.clear();
+    return built;
+  }
+  int generation = 0;
+  std::vector<AppIconPng> pngs;
+  {
+    std::lock_guard<std::mutex> lock(g_icon_mu);
+    generation = g_icon_generation;
+    pngs = g_icon_pngs;
+  }
+  if (built.generation == generation && (built.image || pngs.empty()))
+    return built;
+  if (pngs.empty()) {
+    built.image = nullptr;
+    built.property.clear();
+    built.generation = generation;
+    return built;
+  }
+  // Decode each file alone. One CefImage keeps a single representation, and
+  // the desktop then scales that image to the taskbar size.
+  struct DecodedIcon {
+    int width = 0;
+    int height = 0;
+    float scale = 1.f;
+    std::vector<unsigned char> png;
+    std::vector<unsigned char> pixels;
+  };
+  std::vector<DecodedIcon> decoded;
+  for (const auto& png : pngs) {
+    if (png.bytes.size() < 8)
+      continue;
+    CefRefPtr<CefImage> one = CefImage::CreateImage();
+    if (!one->AddPNG(1.f, png.bytes.data(), png.bytes.size()))
+      continue;
+    int width = 0;
+    int height = 0;
+    CefRefPtr<CefBinaryValue> bitmap = one->GetAsBitmap(
+        1.f, CEF_COLOR_TYPE_RGBA_8888, CEF_ALPHA_TYPE_POSTMULTIPLIED, width, height);
+    if (!bitmap || width <= 0 || height <= 0)
+      continue;
+    size_t nbytes = bitmap->GetSize();
+    size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (nbytes < count * 4)
+      continue;
+    DecodedIcon icon;
+    icon.width = width;
+    icon.height = height;
+    icon.png = png.bytes;
+    icon.pixels.resize(nbytes);
+    bitmap->GetData(icon.pixels.data(), nbytes, 0);
+    decoded.push_back(std::move(icon));
+  }
+  std::sort(decoded.begin(), decoded.end(), [](const DecodedIcon& a, const DecodedIcon& b) {
+    return a.width > b.width;
+  });
+  decoded.erase(std::unique(decoded.begin(), decoded.end(),
+                            [](const DecodedIcon& a, const DecodedIcon& b) {
+                              return a.width == b.width && a.height == b.height;
+                            }),
+                decoded.end());
+  int base = decoded.empty() ? 16 : decoded.back().width;
+  if (base <= 0)
+    base = 16;
+  CefRefPtr<CefImage> image = CefImage::CreateImage();
+  for (auto it = decoded.rbegin(); it != decoded.rend(); ++it) {
+    it->scale = static_cast<float>(it->width) / static_cast<float>(base);
+    image->AddPNG(it->scale, it->png.data(), it->png.size());
+  }
+  std::vector<unsigned long> property;
+  // Largest first. Some window managers use the first icon in the property.
+  for (const DecodedIcon& icon : decoded) {
+    size_t count = static_cast<size_t>(icon.width) * static_cast<size_t>(icon.height);
+    property.push_back(static_cast<unsigned long>(icon.width));
+    property.push_back(static_cast<unsigned long>(icon.height));
+    for (size_t i = 0; i < count; ++i) {
+      size_t offset = i * 4;
+      unsigned long argb = (static_cast<unsigned long>(icon.pixels[offset + 3]) << 24) |
+                           (static_cast<unsigned long>(icon.pixels[offset]) << 16) |
+                           (static_cast<unsigned long>(icon.pixels[offset + 1]) << 8) |
+                           static_cast<unsigned long>(icon.pixels[offset + 2]);
+      property.push_back(argb);
+    }
+  }
+  built.image = image->IsEmpty() ? nullptr : image;
+  built.property = std::move(property);
+  built.generation = generation;
+  return built;
+}
+
+void SetHostClass(Display* display, Window window) {
+  std::string name;
+  {
+    std::lock_guard<std::mutex> lock(g_icon_mu);
+    name = g_window_class;
+  }
+  if (name.empty())
+    return;
+  // Both fields are the desktop id. StartupWMClass is matched as given.
   XClassHint hint;
-  hint.res_name = const_cast<char*>("nyxt");
-  hint.res_class = const_cast<char*>("Nyxt");
+  hint.res_name = const_cast<char*>(name.c_str());
+  hint.res_class = const_cast<char*>(name.c_str());
   XSetClassHint(display, window, &hint);
+}
+
+void SetHostIcon(Display* display, Window window) {
+  const std::vector<unsigned long>& property = BuiltAppIcon().property;
+  if (property.empty())
+    return;
+  Atom atom = XInternAtom(display, "_NET_WM_ICON", False);
+  XChangeProperty(display, window, atom, XA_CARDINAL, 32, PropModeReplace,
+                  reinterpret_cast<unsigned char*>(const_cast<unsigned long*>(property.data())),
+                  static_cast<int>(property.size()));
+}
+
+void SetHostIdentity(Display* display, Window window) {
+  SetHostClass(display, window);
+  SetHostIcon(display, window);
 }
 
 void UnmapNative(Display* display, Window window) { XUnmapWindow(display, window); }
 
 void NameNativeWindow(CefRefPtr<CefWindow> window) {
   if (window)
-    ForEachAncestor(window->GetWindowHandle(), SetNyxtClass);
+    ForEachAncestor(window->GetWindowHandle(), SetHostIdentity);
 }
 
 void UnmapNativeWindow(CefRefPtr<CefWindow> window) {
   if (window)
     ForEachAncestor(window->GetWindowHandle(), UnmapNative);
 }
+
+void ApplyHostIdentity(CefRefPtr<CefWindow> window) {
+  if (!window)
+    return;
+  BuiltIcon& icon = BuiltAppIcon();
+  if (icon.image) {
+    window->SetWindowIcon(icon.image);
+    window->SetWindowAppIcon(icon.image);
+  }
+  NameNativeWindow(window);
+}
+
+void ReleaseAppIcon() {
+  AppIconReleased() = true;
+  BuiltIcon& icon = BuiltAppIcon();
+  icon.image = nullptr;
+  icon.property.clear();
+}
 #else
 void NameNativeWindow(CefRefPtr<CefWindow> window) { (void)window; }
 void UnmapNativeWindow(CefRefPtr<CefWindow> window) { (void)window; }
+void ApplyHostIdentity(CefRefPtr<CefWindow> window) { (void)window; }
+void ReleaseAppIcon() {}
 #endif
 
 void CloseTrackedBrowsers() {
@@ -1357,6 +1536,7 @@ void CloseTrackedBrowsers() {
                 if (g_loop_done.load())
                   return;
                 g_menu = nullptr;
+                ReleaseAppIcon();
                 {
                   std::lock_guard<std::mutex> lock(g_browser_mu);
                   g_browsers.clear();
@@ -2044,8 +2224,22 @@ class WindowDelegate : public CefWindowDelegate {
   }
 
   void OnWindowCreated(CefRefPtr<CefWindow> window) override {
+    // Set the icon before the window is mapped. Chromium then installs its
+    // product logo, so the host icon is applied again on later turns.
+    ApplyHostIdentity(window);
     if (window)
       window->Show();
+    int id = id_;
+    CefPostTask(TID_UI, new ClosureTask([id]() {
+                  if (auto record = FindWindow(id))
+                    ApplyHostIdentity(record->window);
+                }));
+    CefPostDelayedTask(TID_UI,
+                       new ClosureTask([id]() {
+                         if (auto record = FindWindow(id))
+                           ApplyHostIdentity(record->window);
+                       }),
+                       300);
   }
 
   void OnWindowDestroyed(CefRefPtr<CefWindow> window) override {
@@ -2478,6 +2672,12 @@ void cl_cef_set_download_directory(const char* path) {
   g_download_directory = path ? path : "";
 }
 
+void cl_cef_add_app_icon_png(float scale_factor, const void* png, size_t size) {
+  RememberAppIcon(scale_factor, png, size);
+}
+
+void cl_cef_set_window_class(const char* name) { RememberWindowClass(name); }
+
 int cl_cef_window_create(int width, int height, const char* title) {
   int id = AllocateId();
   auto record = std::make_shared<WindowRecord>();
@@ -2504,7 +2704,7 @@ int cl_cef_window_create(int width, int height, const char* title) {
       record->layout = record->window->SetToBoxLayout(settings);
       record->window->SetTitle(record->title);
       record->window->Show();
-      NameNativeWindow(record->window);
+      ApplyHostIdentity(record->window);
     }
   });
   if (!record->window) {
@@ -2639,6 +2839,8 @@ void PlaceView(const std::shared_ptr<WindowRecord>& window,
     view->flex_set = true;
   }
   window->window->Layout();
+  // Adding a browser view is when Chrome paints the product logo again.
+  ApplyHostIdentity(window->window);
 }
 
 void cl_cef_window_add_view(int window_id, int view_id) {

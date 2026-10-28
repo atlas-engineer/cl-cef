@@ -31,6 +31,30 @@
   (:export-accessor-names-p t)
   (:documentation "A top-level native window that hosts `view's."))
 
+(export-always 'set-window-class)
+(defun set-window-class (name)
+  "Set WM_CLASS for windows created afterwards.
+Chrome-style windows otherwise register as Chromium, so the desktop matches
+the wrong application. NAME is the desktop-file id. Call this before the
+first window. An empty string leaves Chromium's default."
+  (check-type name string)
+  (ensure-library)
+  (cl-cef-set-window-class name))
+
+(export-always 'add-app-icon)
+(defun add-app-icon (scale png)
+  "Register PNG as one representation of the window icon at SCALE.
+SCALE is 1.0 for the base image and the ratio of pixel size to that base for
+a larger one. A Chrome-style window otherwise uses the Chromium logo. Call
+this before the first window."
+  (check-type png (vector (unsigned-byte 8)))
+  (let ((bytes (coerce png '(simple-array (unsigned-byte 8) (*)))))
+    (ensure-library)
+    (cffi:with-pointer-to-vector-data (pointer bytes)
+      (cl-cef-add-app-icon-png (coerce scale 'single-float)
+                               pointer
+                               (length bytes)))))
+
 (defmethod initialize-instance :after ((window window) &key)
   (let ((id (cl-cef-window-create (width window) (height window) (title window))))
     (unless (plusp id)
