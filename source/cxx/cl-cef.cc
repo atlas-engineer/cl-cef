@@ -91,7 +91,12 @@ void MaskFpTraps() {
   asm volatile("fnstcw %0" : "=m"(control));
   control = static_cast<unsigned short>(control | 0x3fu);
   asm volatile("fldcw %0" ::"m"(control));
-#else
+#elif defined(__aarch64__)
+  uint64_t fpcr = 0;
+  asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+  fpcr &= ~uint64_t{0x9f00};
+  asm volatile("msr fpcr, %0" ::"r"(fpcr));
+  asm volatile("isb" ::: "memory");
 #endif
 }
 
