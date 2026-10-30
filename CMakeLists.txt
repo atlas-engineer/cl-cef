@@ -43,6 +43,9 @@ target_compile_features(cl-cef PRIVATE cxx_std_20)
 target_include_directories(cl-cef PRIVATE "${CEF_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}/source/cxx")
 add_dependencies(cl-cef libcef_dll_wrapper)
 target_link_libraries(cl-cef PRIVATE libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+if(OS_MAC)
+  target_link_libraries(cl-cef PRIVATE "-framework AppKit" "-framework Cocoa" objc)
+endif()
 set_target_properties(cl-cef PROPERTIES
   BUILD_RPATH "$ORIGIN;${CEF_BINARY_DIR_RELEASE}"
   INSTALL_RPATH "$ORIGIN;${CEF_BINARY_DIR_RELEASE}"

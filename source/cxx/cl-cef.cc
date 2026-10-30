@@ -62,6 +62,10 @@
 // X.h defines this as 0, which breaks CefCallback::Success.
 #undef Success
 #endif
+#if defined(OS_MAC) || defined(__APPLE__)
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
 
 struct cl_cef_response {
   std::string data;
@@ -2557,6 +2561,26 @@ void cl_cef_request_stop(void) {
 
 void cl_cef_adblock_reset_cosmetic(void) { ResetCosmetic(); }
 
+#if defined(OS_MAC) || defined(__APPLE__)
+// AppKit refuses NSWindow off the process main thread. CEF Views creates
+// NSWindows, so CefInitialize / CefRunMessageLoop must run there. Create the
+// shared application object before Chromium touches AppKit.
+void EnsureNSApplication() {
+  Class ns_application = objc_getClass("NSApplication");
+  if (!ns_application)
+    return;
+  using SendClass = id (*)(Class, SEL);
+  using SendIdInt = id (*)(id, SEL, long);
+  id app = reinterpret_cast<SendClass>(objc_msgSend)(
+      ns_application, sel_registerName("sharedApplication"));
+  if (!app)
+    return;
+  // NSApplicationActivationPolicyRegular = 0
+  reinterpret_cast<SendIdInt>(objc_msgSend)(
+      app, sel_registerName("setActivationPolicy:"), 0);
+}
+#endif
+
 int cl_cef_initialize(int argc,
                       char** argv,
                       const char* subprocess_path,
@@ -2596,6 +2620,9 @@ int cl_cef_initialize(int argc,
   // a REPL quit, which does not exit Lisp, loses them to init and they keep
   // running.
   prctl(PR_SET_CHILD_SUBREAPER, 1);
+#endif
+#if defined(OS_MAC) || defined(__APPLE__)
+  EnsureNSApplication();
 #endif
 
   CefSettings settings;
