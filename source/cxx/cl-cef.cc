@@ -411,6 +411,11 @@ std::shared_ptr<ViewRecord> FindView(int id) {
   return found == g_views.end() ? nullptr : found->second;
 }
 
+bool BrowserBelongsToView(const std::shared_ptr<ViewRecord>& view,
+                          CefRefPtr<CefBrowser> browser) {
+  return !view || !view->browser || !browser || view->browser->IsSame(browser);
+}
+
 // Release the native view. The CefBrowserView has to outlive its browser:
 // dropping it while the browser is still closing runs ~CefViewView, which
 // CHECKs on the UI thread. Call this from OnBrowserDestroyed, after close.
@@ -1634,11 +1639,28 @@ class Client : public CefClient,
     return router_ && router_->OnProcessMessageReceived(browser, frame, source_process, message);
   }
 
+  void OnBeforeDevToolsPopup(CefRefPtr<CefBrowser> browser,
+                             CefWindowInfo& window_info,
+                             CefRefPtr<CefClient>& client,
+                             CefBrowserSettings& settings,
+                             CefRefPtr<CefDictionaryValue>& extra_info,
+                             bool* use_default_window) override {
+    (void)browser;
+    (void)window_info;
+    (void)settings;
+    (void)extra_info;
+    client = nullptr;
+    if (use_default_window)
+      *use_default_window = true;
+  }
+
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     if (!browser)
       return;
     TrackBrowser(browser);
     auto view = FindView(view_id_);
+    if (!BrowserBelongsToView(view, browser))
+      return;
     // The view was dropped while creation was in flight. Close the browser
     // without the window: DoClose treats a missing view as already detached.
     // A shutdown that starts before this callback has to close the browser too,
@@ -1718,21 +1740,29 @@ class Client : public CefClient,
   // During process shutdown the window is going away too, and returning true
   // cancels the browser close, so the Chromium processes stay up.
   bool DoClose(CefRefPtr<CefBrowser> browser) override {
-    (void)browser;
     if (g_quitting.load())
       return false;
     auto view = FindView(view_id_);
+    if (!BrowserBelongsToView(view, browser))
+      return false;
     // A missing view was already removed from the window. Returning false
     // would close that window and every other view it still holds.
     return !view || view->destroying;
   }
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    auto view = FindView(view_id_);
+    if (!BrowserBelongsToView(view, browser)) {
+      if (browser) {
+        g_browser_to_view.erase(browser->GetIdentifier());
+        UntrackBrowser(browser);
+      }
+      return;
+    }
     if (router_) {
       router_->RemoveHandler(queries_.get());
       router_->OnBeforeClose(browser);
     }
-    auto view = FindView(view_id_);
     if (view) {
       view->browser = nullptr;
       view->close_started = true;
@@ -2165,6 +2195,18 @@ class BrowserViewDelegate : public CefBrowserViewDelegate {
   // message, prompt) must be Alloy or CEF refuses to add them.
   cef_runtime_style_t GetBrowserRuntimeStyle() override { return style_; }
 
+  CefRefPtr<CefBrowserViewDelegate> GetDelegateForPopupBrowserView(
+      CefRefPtr<CefBrowserView> browser_view,
+      const CefBrowserSettings& settings,
+      CefRefPtr<CefClient> client,
+      bool is_devtools) override {
+    (void)browser_view;
+    (void)settings;
+    (void)client;
+    (void)is_devtools;
+    return nullptr;
+  }
+
   CefSize GetPreferredSize(CefRefPtr<CefView> view) override { return BarSize(view); }
 
   CefSize GetMinimumSize(CefRefPtr<CefView> view) override { return BarSize(view); }
@@ -2194,9 +2236,8 @@ class BrowserViewDelegate : public CefBrowserViewDelegate {
   void OnBrowserDestroyed(CefRefPtr<CefBrowserView> browser_view,
                           CefRefPtr<CefBrowser> browser) override {
     (void)browser_view;
-    (void)browser;
     auto record = FindView(view_id_);
-    if (!record)
+    if (!record || !BrowserBelongsToView(record, browser))
       return;
     record->browser = nullptr;
     CefPostTask(TID_UI, new ClosureTask([record]() { DropView(record); }));
