@@ -262,6 +262,7 @@ struct WindowRecord {
   int width = 1600;
   int height = 1200;
   std::string title;
+  bool allow_close = false;
 };
 
 std::mutex g_mu;
@@ -2318,7 +2319,14 @@ class WindowDelegate : public CefWindowDelegate {
 
   bool CanClose(CefRefPtr<CefWindow> window) override {
     (void)window;
-    return true;
+    auto record = FindWindow(id_);
+    if (!record || record->allow_close)
+      return true;
+    int id = id_;
+    CefPostTask(TID_UI, new ClosureTask([id]() {
+                  Emit(id, "{\"event\":\"close-request\"}");
+                }));
+    return false;
   }
 
  private:
@@ -2790,6 +2798,8 @@ int cl_cef_window_create(int width, int height, const char* title) {
 
 void cl_cef_window_close(int id) {
   auto record = FindWindow(id);
+  if (record)
+    record->allow_close = true;
   CallUI([&]() {
     if (record && record->window) {
       UnmapNativeWindow(record->window);
