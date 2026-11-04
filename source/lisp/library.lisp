@@ -342,13 +342,6 @@
 (defcef "cl_cef_view_images_enabled" :int
   (id :int))
 
-(defcef "cl_cef_view_set_webgl_enabled" :void
-  (id :int)
-  (enabled :int))
-
-(defcef "cl_cef_view_webgl_enabled" :int
-  (id :int))
-
 (defcef "cl_cef_view_set_user_agent" :void
   (id :int)
   (user-agent :string))

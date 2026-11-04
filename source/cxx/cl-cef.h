@@ -204,8 +204,6 @@ void cl_cef_view_set_javascript_enabled(int id, int enabled);
 int cl_cef_view_javascript_enabled(int id);
 void cl_cef_view_set_images_enabled(int id, int enabled);
 int cl_cef_view_images_enabled(int id);
-void cl_cef_view_set_webgl_enabled(int id, int enabled);
-int cl_cef_view_webgl_enabled(int id);
 void cl_cef_view_set_user_agent(int id, const char* user_agent);
 char* cl_cef_view_get_user_agent(int id);
 void cl_cef_view_set_proxy(int id, const char* proxy_server, const char* bypass_list);

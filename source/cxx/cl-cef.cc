@@ -233,7 +233,6 @@ struct ViewRecord {
   bool focused = false;
   bool javascript = true;
   bool images = true;
-  bool webgl = true;
   bool muted = false;
   int x = 0;
   int y = 0;
@@ -2997,7 +2996,6 @@ int cl_cef_view_create(const char* url, int alloy, int isolated) {
     CefBrowserSettings browser_settings;
     browser_settings.javascript = STATE_ENABLED;
     browser_settings.image_loading = STATE_ENABLED;
-    browser_settings.webgl = STATE_ENABLED;
     CefRefPtr<Client> client = new Client(id);
     record->widget = CefBrowserView::CreateBrowserView(
         client, initial, browser_settings, nullptr,
@@ -3451,21 +3449,6 @@ void cl_cef_view_set_images_enabled(int id, int enabled) {
 int cl_cef_view_images_enabled(int id) {
   auto record = FindView(id);
   return CallUI([&]() { return record && record->images ? 1 : 0; });
-}
-
-void cl_cef_view_set_webgl_enabled(int id, int enabled) {
-  auto record = FindView(id);
-  CallUI([&]() {
-    if (!record)
-      return;
-    record->webgl = enabled != 0;
-    SetBoolPreference(record->context, "webkit.webprefs.webgl_enabled", record->webgl);
-  });
-}
-
-int cl_cef_view_webgl_enabled(int id) {
-  auto record = FindView(id);
-  return CallUI([&]() { return record && record->webgl ? 1 : 0; });
 }
 
 void cl_cef_view_set_user_agent(int id, const char* user_agent) {

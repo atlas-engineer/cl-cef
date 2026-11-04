@@ -179,14 +179,6 @@ the page world; CEF isolated worlds are not exposed here."
 (defmethod images-enabled-p ((web-contents web-contents))
   (plusp (cl-cef-view-images-enabled (id web-contents))))
 
-(export-always 'set-webgl-enabled)
-(defmethod set-webgl-enabled ((web-contents web-contents) enabled)
-  (cl-cef-view-set-webgl-enabled (id web-contents) (flag enabled)))
-
-(export-always 'webgl-enabled-p)
-(defmethod webgl-enabled-p ((web-contents web-contents))
-  (plusp (cl-cef-view-webgl-enabled (id web-contents))))
-
 (export-always 'set-user-agent)
 (defmethod set-user-agent ((web-contents web-contents) user-agent)
   (cl-cef-view-set-user-agent (id web-contents) user-agent))
