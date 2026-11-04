@@ -117,6 +117,14 @@ class ClosureTask : public CefTask {
   IMPLEMENT_REFCOUNTING(ClosureTask);
 };
 
+class NoopCompletion : public CefCompletionCallback {
+ public:
+  void OnComplete() override {}
+
+ private:
+  IMPLEMENT_REFCOUNTING(NoopCompletion);
+};
+
 // CefCallback::Continue resumes a load only when it runs on the UI thread.
 void PostCefCallback(CefRefPtr<CefCallback> async, bool cancel) {
   if (!async)
@@ -2746,6 +2754,27 @@ void cl_cef_shutdown(void) {
 void cl_cef_reap_helpers(void) { ReapHelpers(); }
 
 int cl_cef_on_ui_thread(void) { return CefCurrentlyOn(TID_UI) ? 1 : 0; }
+
+void cl_cef_clear_http_cache(void) {
+  if (!g_initialized.load())
+    return;
+  CallUI([]() {
+    std::vector<CefRefPtr<CefRequestContext>> contexts;
+    if (CefRefPtr<CefRequestContext> global = CefRequestContext::GetGlobalContext())
+      contexts.push_back(global);
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      for (const auto& entry : g_views) {
+        const auto& record = entry.second;
+        if (record && record->isolated && record->context)
+          contexts.push_back(record->context);
+      }
+    }
+    CefRefPtr<CefCompletionCallback> callback = new NoopCompletion();
+    for (const auto& context : contexts)
+      context->ClearHttpCache(callback);
+  });
+}
 
 void cl_cef_string_free(char* string) { std::free(string); }
 

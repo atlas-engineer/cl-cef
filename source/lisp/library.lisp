@@ -110,6 +110,8 @@
 
 (defcef "cl_cef_on_ui_thread" :int)
 
+(defcef "cl_cef_clear_http_cache" :void)
+
 (defcef "cl_cef_string_free" :void
   (string :pointer))
 

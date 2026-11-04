@@ -120,6 +120,7 @@ void cl_cef_shutdown(void);
  * them behind when the Lisp process stays up, as it does from a REPL. */
 void cl_cef_reap_helpers(void);
 int cl_cef_on_ui_thread(void);
+void cl_cef_clear_http_cache(void);
 
 void cl_cef_string_free(char* string);
 void cl_cef_set_download_directory(const char* path);

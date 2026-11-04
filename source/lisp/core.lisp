@@ -172,6 +172,13 @@ The sandbox needs extra setup (chrome-sandbox) that this bridge does not perform
   (and *library-loaded-p*
        (plusp (cl-cef-on-ui-thread))))
 
+(export-always 'clear-cache)
+(defun clear-cache ()
+  "Clear the HTTP cache of the global request context and of isolated view contexts."
+  (when *library-loaded-p*
+    (cl-cef-clear-http-cache)
+    t))
+
 (defun native-name (path)
   (when path
     (uiop:native-namestring path)))
