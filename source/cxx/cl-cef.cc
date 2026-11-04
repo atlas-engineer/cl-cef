@@ -232,7 +232,7 @@ struct ViewRecord {
   std::string proxy;
   bool focused = false;
   bool javascript = true;
-  bool images = true;
+  std::atomic<bool> images{true};
   bool muted = false;
   int x = 0;
   int y = 0;
@@ -2013,6 +2013,12 @@ class Client : public CefClient,
     (void)browser;
     if (!request || !callback)
       return RV_CONTINUE;
+    auto record = FindView(view_id_);
+    if (record && !record->images.load()) {
+      cef_resource_type_t kind = request->GetResourceType();
+      if (kind == RT_IMAGE || kind == RT_FAVICON)
+        return RV_CANCEL;
+    }
     std::string url = request->GetURL().ToString();
     const char* type = ResourceTypeName(request->GetResourceType());
     if (!g_request_cb.load() || !type || !HttpUrl(url))
@@ -3438,17 +3444,13 @@ int cl_cef_view_javascript_enabled(int id) {
 
 void cl_cef_view_set_images_enabled(int id, int enabled) {
   auto record = FindView(id);
-  CallUI([&]() {
-    if (!record)
-      return;
-    record->images = enabled != 0;
-    SetBoolPreference(record->context, "webkit.webprefs.loads_images_automatically", record->images);
-  });
+  if (record)
+    record->images.store(enabled != 0);
 }
 
 int cl_cef_view_images_enabled(int id) {
   auto record = FindView(id);
-  return CallUI([&]() { return record && record->images ? 1 : 0; });
+  return record && record->images.load() ? 1 : 0;
 }
 
 void cl_cef_view_set_user_agent(int id, const char* user_agent) {
