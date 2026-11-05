@@ -328,13 +328,6 @@
   (id :int)
   (url :string))
 
-(defcef "cl_cef_view_set_javascript_enabled" :void
-  (id :int)
-  (enabled :int))
-
-(defcef "cl_cef_view_javascript_enabled" :int
-  (id :int))
-
 (defcef "cl_cef_view_set_images_enabled" :void
   (id :int)
   (enabled :int))

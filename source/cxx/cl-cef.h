@@ -200,8 +200,6 @@ int cl_cef_view_add_user_script(int id, const char* code, int document_start, in
 void cl_cef_view_remove_user_script(int id, int script_id);
 
 void cl_cef_view_download_url(int id, const char* url);
-void cl_cef_view_set_javascript_enabled(int id, int enabled);
-int cl_cef_view_javascript_enabled(int id);
 void cl_cef_view_set_images_enabled(int id, int enabled);
 int cl_cef_view_images_enabled(int id);
 void cl_cef_view_set_blocked_hosts(int id, const char* hosts);

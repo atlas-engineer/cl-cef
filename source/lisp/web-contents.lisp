@@ -163,14 +163,6 @@ the page world; CEF isolated worlds are not exposed here."
 (defmethod close-dev-tools ((web-contents web-contents))
   (cl-cef-view-close-devtools (id web-contents)))
 
-(export-always 'set-javascript-enabled)
-(defmethod set-javascript-enabled ((web-contents web-contents) enabled)
-  (cl-cef-view-set-javascript-enabled (id web-contents) (flag enabled)))
-
-(export-always 'javascript-enabled-p)
-(defmethod javascript-enabled-p ((web-contents web-contents))
-  (plusp (cl-cef-view-javascript-enabled (id web-contents))))
-
 (export-always 'set-images-enabled)
 (defmethod set-images-enabled ((web-contents web-contents) enabled)
   (cl-cef-view-set-images-enabled (id web-contents) (flag enabled)))

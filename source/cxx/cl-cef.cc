@@ -15,6 +15,7 @@
 #include "include/cef_command_handler.h"
 #include "include/cef_command_ids.h"
 #include "include/cef_parser.h"
+#include "include/cef_request_context_handler.h"
 #include "include/cef_response_filter.h"
 #include "include/base/cef_build.h"
 #include "include/views/cef_box_layout.h"
@@ -37,6 +38,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <memory>
@@ -268,7 +270,6 @@ struct ViewRecord {
   std::string user_agent;
   std::string proxy;
   bool focused = false;
-  bool javascript = true;
   std::atomic<bool> images{true};
   std::atomic<std::shared_ptr<const HostSet>> blocked_hosts;
   bool muted = false;
@@ -280,8 +281,11 @@ struct ViewRecord {
   // whatever the bars do not use. Browser views otherwise prefer a window-sized
   // rectangle, which is why the status text (sized in vh) became huge.
   bool bar = false;
-  // Status, message, and prompt documents are about:blank. The shared context
+  // Status, message, and prompt documents are about:blank. The page context
   // remembers a zoom for that URL, and every about:blank view inherits it.
+  // Each of those views has its own context. An in-memory profile is another
+  // name for the page profile's theme service, and the window observer is
+  // added to that service again.
   bool isolated = false;
   int bar_height = 0;
   bool flex_set = false;
@@ -323,6 +327,7 @@ std::atomic<cl_cef_scheme_callback> g_scheme_cb{nullptr};
 // Names registered with the global request context. An isolated context does
 // not inherit those factories, so a panel view would fail every lisp: fetch.
 std::vector<std::string> g_scheme_names;
+std::string g_root_cache_path;
 std::atomic<bool> g_initialized{false};
 std::atomic<bool> g_quitting{false};
 std::atomic<bool> g_loop_done{false};
@@ -481,6 +486,10 @@ void DropView(const std::shared_ptr<ViewRecord>& record) {
   record->devtools_observer = nullptr;
   record->widget = nullptr;
   record->context = nullptr;
+  if (record->isolated && !g_root_cache_path.empty()) {
+    std::error_code error;
+    std::filesystem::remove_all(g_root_cache_path + "/view-" + std::to_string(record->id), error);
+  }
 }
 
 std::shared_ptr<WindowRecord> FindWindow(int id) {
@@ -566,17 +575,6 @@ void ApplyScripts(const std::shared_ptr<ViewRecord>& view,
     for (const auto& entry : view->css)
       ApplyCss(frame, entry.first, entry.second);
   }
-}
-
-void SetBoolPreference(CefRefPtr<CefRequestContext> context,
-                       const char* name,
-                       bool enabled) {
-  if (!context)
-    return;
-  CefRefPtr<CefValue> value = CefValue::Create();
-  value->SetBool(enabled);
-  CefString error;
-  context->SetPreference(name, value, error);
 }
 
 void SetProxyPreference(CefRefPtr<CefRequestContext> context,
@@ -791,6 +789,31 @@ void RegisterSchemeFactories(CefRefPtr<CefRequestContext> context) {
       CefRegisterSchemeHandlerFactory(name, "", new SchemeFactory(name));
   }
 }
+
+class ViewContextHandler : public CefRequestContextHandler {
+ public:
+  ViewContextHandler(std::shared_ptr<ViewRecord> record,
+                     std::string url,
+                     cef_runtime_style_t style,
+                     std::shared_ptr<std::promise<void>> done)
+      : record_(std::move(record)),
+        url_(std::move(url)),
+        style_(style),
+        done_(std::move(done)) {}
+
+  void OnRequestContextInitialized(CefRefPtr<CefRequestContext> context) override;
+  void Fail() { Finish(); }
+
+ private:
+  void Finish();
+
+  std::shared_ptr<ViewRecord> record_;
+  std::string url_;
+  cef_runtime_style_t style_;
+  std::shared_ptr<std::promise<void>> done_;
+  std::atomic<bool> finished_{false};
+  IMPLEMENT_REFCOUNTING(ViewContextHandler);
+};
 
 class QueryHandler : public CefMessageRouterBrowserSide::Handler {
  public:
@@ -2825,6 +2848,7 @@ int cl_cef_initialize(int argc,
   if (subprocess_path && *subprocess_path)
     CefString(&settings.browser_subprocess_path) = subprocess_path;
   if (cache_path && *cache_path) {
+    g_root_cache_path = cache_path;
     CefString(&settings.root_cache_path) = cache_path;
     CefString(&settings.cache_path) = std::string(cache_path) + "/cache";
   }
@@ -3109,6 +3133,32 @@ void cl_cef_window_remove_view(int window_id, int view_id) {
   });
 }
 
+void ViewContextHandler::Finish() {
+  bool expected = false;
+  if (!finished_.compare_exchange_strong(expected, true))
+    return;
+  try {
+    done_->set_value();
+  } catch (const std::future_error&) {
+  }
+}
+
+void ViewContextHandler::OnRequestContextInitialized(CefRefPtr<CefRequestContext> context) {
+  if (!record_->destroying && context) {
+    record_->context = context;
+    // The status, message, and prompt views use this context. Their buttons
+    // fetch lisp: URLs, which only resolve where a factory is registered.
+    RegisterSchemeFactories(context);
+    CefBrowserSettings browser_settings;
+    browser_settings.javascript = STATE_ENABLED;
+    browser_settings.image_loading = STATE_ENABLED;
+    record_->widget = CefBrowserView::CreateBrowserView(
+        new Client(record_->id), url_, browser_settings, nullptr, context,
+        new BrowserViewDelegate(style_, record_->id));
+  }
+  Finish();
+}
+
 int cl_cef_view_create(const char* url, int alloy, int isolated) {
   int id = AllocateId();
   auto record = std::make_shared<ViewRecord>();
@@ -3120,23 +3170,34 @@ int cl_cef_view_create(const char* url, int alloy, int isolated) {
   }
   std::string initial = url && *url ? url : "about:blank";
   cef_runtime_style_t style = alloy ? CEF_RUNTIME_STYLE_ALLOY : CEF_RUNTIME_STYLE_CHROME;
-  CallUI([record, initial, id, style]() {
-    CefRequestContextSettings context_settings;
-    record->context = CefRequestContext::CreateContext(context_settings, nullptr);
-    // The status, message, and prompt views use this context. Their buttons
-    // fetch lisp: URLs, which only resolve where a factory is registered.
-    if (record->isolated)
-      RegisterSchemeFactories(record->context);
-    CefBrowserSettings browser_settings;
-    browser_settings.javascript = STATE_ENABLED;
-    browser_settings.image_loading = STATE_ENABLED;
-    CefRefPtr<Client> client = new Client(id);
-    record->widget = CefBrowserView::CreateBrowserView(
-        client, initial, browser_settings, nullptr,
-        record->isolated ? record->context : nullptr,
-        new BrowserViewDelegate(style, id));
-  });
+  if (record->isolated && !CefCurrentlyOn(TID_UI)) {
+    auto done = std::make_shared<std::promise<void>>();
+    auto ready = done->get_future();
+    CefPostTask(TID_UI, new ClosureTask([record, initial, style, done]() {
+                  CefRequestContextSettings settings;
+                  if (!g_root_cache_path.empty())
+                    CefString(&settings.cache_path) =
+                        g_root_cache_path + "/view-" + std::to_string(record->id);
+                  auto handler = new ViewContextHandler(record, initial, style, done);
+                  if (!CefRequestContext::CreateContext(settings, handler))
+                    handler->Fail();
+                }));
+    ready.wait_for(std::chrono::seconds(30));
+  } else {
+    CallUI([record, initial, style]() {
+      CefRequestContextSettings context_settings;
+      record->context = CefRequestContext::CreateContext(context_settings, nullptr);
+      CefBrowserSettings browser_settings;
+      browser_settings.javascript = STATE_ENABLED;
+      browser_settings.image_loading = STATE_ENABLED;
+      record->widget = CefBrowserView::CreateBrowserView(
+          new Client(record->id), initial, browser_settings, nullptr,
+          record->isolated ? record->context : nullptr,
+          new BrowserViewDelegate(style, record->id));
+    });
+  }
   if (!record->widget) {
+    record->destroying = true;
     std::lock_guard<std::mutex> lock(g_mu);
     g_views.erase(id);
     return 0;
@@ -3553,21 +3614,6 @@ void cl_cef_view_download_url(int id, const char* url) {
       browser->GetHost()->StartDownload(target);
     });
   });
-}
-
-void cl_cef_view_set_javascript_enabled(int id, int enabled) {
-  auto record = FindView(id);
-  CallUI([&]() {
-    if (!record)
-      return;
-    record->javascript = enabled != 0;
-    SetBoolPreference(record->context, "webkit.webprefs.javascript_enabled", record->javascript);
-  });
-}
-
-int cl_cef_view_javascript_enabled(int id) {
-  auto record = FindView(id);
-  return CallUI([&]() { return record && record->javascript ? 1 : 0; });
 }
 
 void cl_cef_view_set_blocked_hosts(int id, const char* hosts) {
