@@ -3411,7 +3411,7 @@ int cl_cef_view_can_go_forward(int id) {
 void cl_cef_view_set_zoom_factor(int id, double factor) {
   auto record = FindView(id);
   CallUI([&]() {
-    if (record && record->browser && factor > 0.0)
+    if (record && record->browser && factor >= 0.0)
       record->browser->GetHost()->SetZoomLevel(FactorToLevel(factor));
   });
 }
