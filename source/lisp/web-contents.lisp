@@ -175,6 +175,12 @@ the page world; CEF isolated worlds are not exposed here."
 (defmethod set-images-enabled ((web-contents web-contents) enabled)
   (cl-cef-view-set-images-enabled (id web-contents) (flag enabled)))
 
+(export-always 'set-blocked-hosts)
+(defmethod set-blocked-hosts ((web-contents web-contents) hosts)
+  "Drop requests whose host is named in HOSTS, one host per line.
+An empty string clears the filter. The match is exact and case-insensitive."
+  (cl-cef-view-set-blocked-hosts (id web-contents) (or hosts "")))
+
 (export-always 'images-enabled-p)
 (defmethod images-enabled-p ((web-contents web-contents))
   (plusp (cl-cef-view-images-enabled (id web-contents))))

@@ -339,6 +339,10 @@
   (id :int)
   (enabled :int))
 
+(defcef "cl_cef_view_set_blocked_hosts" :void
+  (id :int)
+  (hosts :string))
+
 (defcef "cl_cef_view_images_enabled" :int
   (id :int))
 

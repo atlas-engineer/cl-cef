@@ -43,8 +43,10 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -219,6 +221,41 @@ class DevToolsObserver : public CefDevToolsMessageObserver {
   IMPLEMENT_REFCOUNTING(DevToolsObserver);
 };
 
+struct HostHash {
+  using is_transparent = void;
+  size_t operator()(std::string_view text) const noexcept {
+    size_t hash = 1469598103934665603ull;
+    for (unsigned char character : text) {
+      if (character >= 'A' && character <= 'Z')
+        character = static_cast<unsigned char>(character - 'A' + 'a');
+      hash ^= character;
+      hash *= 1099511628211ull;
+    }
+    return hash;
+  }
+};
+
+struct HostEqual {
+  using is_transparent = void;
+  bool operator()(std::string_view left, std::string_view right) const noexcept {
+    if (left.size() != right.size())
+      return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+      unsigned char a = static_cast<unsigned char>(left[index]);
+      unsigned char b = static_cast<unsigned char>(right[index]);
+      if (a >= 'A' && a <= 'Z')
+        a = static_cast<unsigned char>(a - 'A' + 'a');
+      if (b >= 'A' && b <= 'Z')
+        b = static_cast<unsigned char>(b - 'A' + 'a');
+      if (a != b)
+        return false;
+    }
+    return true;
+  }
+};
+
+using HostSet = std::unordered_set<std::string, HostHash, HostEqual>;
+
 struct ViewRecord {
   int id = 0;
   CefRefPtr<CefBrowserView> widget;
@@ -233,6 +270,7 @@ struct ViewRecord {
   bool focused = false;
   bool javascript = true;
   std::atomic<bool> images{true};
+  std::atomic<std::shared_ptr<const HostSet>> blocked_hosts;
   bool muted = false;
   int x = 0;
   int y = 0;
@@ -1020,6 +1058,91 @@ void ArmRequestTimeout(const std::shared_ptr<RequestJob>& job) {
       return;
     ResumeCallback(job->async, false);
   }).detach();
+}
+
+std::string_view UrlHost(std::string_view url) {
+  size_t start = 0;
+  if (url.size() >= 8 && url.compare(0, 8, "https://") == 0)
+    start = 8;
+  else if (url.size() >= 7 && url.compare(0, 7, "http://") == 0)
+    start = 7;
+  else
+    return {};
+  size_t end = url.find_first_of("/?#", start);
+  if (end == std::string_view::npos)
+    end = url.size();
+  size_t at = url.rfind('@', end == 0 ? 0 : end - 1);
+  if (at != std::string_view::npos && at >= start)
+    start = at + 1;
+  if (start >= end)
+    return {};
+  std::string_view host = url.substr(start, end - start);
+  if (!host.empty() && host.front() == '[') {
+    size_t close = host.find(']');
+    if (close == std::string_view::npos)
+      return {};
+    host = host.substr(1, close - 1);
+  } else {
+    size_t colon = host.find(':');
+    if (colon != std::string_view::npos && host.find(':', colon + 1) == std::string_view::npos)
+      host = host.substr(0, colon);
+  }
+  while (!host.empty() && host.back() == '.')
+    host.remove_suffix(1);
+  return host;
+}
+
+bool HostBlocked(const HostSet& hosts, std::string_view url) {
+  std::string_view host = UrlHost(url);
+  return !host.empty() && hosts.find(host) != hosts.end();
+}
+
+std::shared_ptr<const HostSet> ParseBlockedHosts(const char* text) {
+  if (!text || !*text)
+    return nullptr;
+  auto hosts = std::make_shared<HostSet>();
+  std::string_view input(text);
+  size_t start = 0;
+  while (start <= input.size()) {
+    size_t end = input.find('\n', start);
+    if (end == std::string_view::npos)
+      end = input.size();
+    std::string_view line = input.substr(start, end - start);
+    while (!line.empty() &&
+           (line.front() == ' ' || line.front() == '\t' || line.front() == '\r'))
+      line.remove_prefix(1);
+    while (!line.empty() &&
+           (line.back() == ' ' || line.back() == '\t' || line.back() == '\r'))
+      line.remove_suffix(1);
+    if (!line.empty() && line.front() == '[') {
+      line.remove_prefix(1);
+      size_t close = line.find(']');
+      if (close != std::string_view::npos)
+        line = line.substr(0, close);
+    } else {
+      size_t colon = line.find(':');
+      if (colon != std::string_view::npos && line.find(':', colon + 1) == std::string_view::npos)
+        line = line.substr(0, colon);
+    }
+    while (!line.empty() && line.back() == '.')
+      line.remove_suffix(1);
+    if (!line.empty()) {
+      std::string key;
+      key.reserve(line.size());
+      for (unsigned char character : line) {
+        if (character >= 'A' && character <= 'Z')
+          character = static_cast<unsigned char>(character - 'A' + 'a');
+        key.push_back(static_cast<char>(character));
+      }
+      hosts->insert(std::move(key));
+    }
+    if (end == input.size())
+      break;
+    start = end + 1;
+  }
+  if (hosts->empty())
+    return nullptr;
+  return hosts;
 }
 
 bool HttpUrl(const std::string& url) {
@@ -2020,6 +2143,11 @@ class Client : public CefClient,
         return RV_CANCEL;
     }
     std::string url = request->GetURL().ToString();
+    if (record) {
+      auto hosts = record->blocked_hosts.load(std::memory_order_acquire);
+      if (hosts && HostBlocked(*hosts, url))
+        return RV_CANCEL;
+    }
     const char* type = ResourceTypeName(request->GetResourceType());
     if (!g_request_cb.load() || !type || !HttpUrl(url))
       return RV_CONTINUE;
@@ -3440,6 +3568,13 @@ void cl_cef_view_set_javascript_enabled(int id, int enabled) {
 int cl_cef_view_javascript_enabled(int id) {
   auto record = FindView(id);
   return CallUI([&]() { return record && record->javascript ? 1 : 0; });
+}
+
+void cl_cef_view_set_blocked_hosts(int id, const char* hosts) {
+  auto record = FindView(id);
+  if (!record)
+    return;
+  record->blocked_hosts.store(ParseBlockedHosts(hosts), std::memory_order_release);
 }
 
 void cl_cef_view_set_images_enabled(int id, int enabled) {
