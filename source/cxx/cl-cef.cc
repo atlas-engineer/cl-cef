@@ -287,6 +287,7 @@ struct ViewRecord {
   // name for the page profile's theme service, and the window observer is
   // added to that service again.
   bool isolated = false;
+  cef_color_t background_color = 0;
   int bar_height = 0;
   bool flex_set = false;
   // Set while this view is being destroyed. DoClose uses it to close the
@@ -329,6 +330,7 @@ std::atomic<cl_cef_scheme_callback> g_scheme_cb{nullptr};
 std::vector<std::string> g_scheme_names;
 std::string g_root_cache_path;
 std::atomic<bool> g_initialized{false};
+std::atomic<cef_color_t> g_background_color{0};
 std::atomic<bool> g_quitting{false};
 std::atomic<bool> g_loop_done{false};
 // Browsers still alive. Released on the UI thread, before CefShutdown.
@@ -2351,10 +2353,45 @@ class Client : public CefClient,
   IMPLEMENT_REFCOUNTING(Client);
 };
 
+cef_color_t NormalizeBackground(unsigned int color) {
+  if (color == 0)
+    return 0;
+  return static_cast<cef_color_t>((color & 0x00FFFFFFu) | 0xFF000000u);
+}
+
+cef_color_t ResolveBackground(unsigned int color) {
+  cef_color_t normalized = NormalizeBackground(color);
+  return normalized ? normalized : g_background_color.load();
+}
+
+void ConfigureBrowserBackground(CefBrowserSettings& settings, cef_color_t color) {
+  settings.javascript = STATE_ENABLED;
+  settings.image_loading = STATE_ENABLED;
+  if (CefColorGetA(color) == 0xFF)
+    settings.background_color = color;
+}
+
+void PaintViewBackground(CefRefPtr<CefView> view, cef_color_t color) {
+  if (view && CefColorGetA(color) == 0xFF)
+    view->SetBackgroundColor(color);
+}
+
+void PaintWindowBackground(CefRefPtr<CefWindow> window) {
+  cef_color_t color = g_background_color.load();
+  if (window && CefColorGetA(color) == 0xFF)
+    window->SetBackgroundColor(color);
+}
+
 class BrowserViewDelegate : public CefBrowserViewDelegate {
  public:
   BrowserViewDelegate(cef_runtime_style_t style, int view_id)
       : style_(style), view_id_(view_id) {}
+
+  void OnThemeChanged(CefRefPtr<CefView> view) override {
+    auto record = FindView(view_id_);
+    if (record)
+      PaintViewBackground(view, record->background_color);
+  }
 
   // A Chrome window hosts one Chrome browser view. Further views (status,
   // message, prompt) must be Alloy or CEF refuses to add them.
@@ -2441,6 +2478,7 @@ class WindowDelegate : public CefWindowDelegate {
   void OnWindowCreated(CefRefPtr<CefWindow> window) override {
     // Set the icon before the window is mapped. Chromium then installs its
     // product logo, so the host icon is applied again on later turns.
+    PaintWindowBackground(window);
     ApplyHostIdentity(window);
     if (window)
       window->Show();
@@ -2455,6 +2493,11 @@ class WindowDelegate : public CefWindowDelegate {
                            ApplyHostIdentity(record->window);
                        }),
                        300);
+  }
+
+  void OnThemeColorsChanged(CefRefPtr<CefWindow> window, bool chrome_theme) override {
+    (void)chrome_theme;
+    PaintWindowBackground(window);
   }
 
   void OnWindowDestroyed(CefRefPtr<CefWindow> window) override {
@@ -2840,6 +2883,9 @@ int cl_cef_initialize(int argc,
 
   CefSettings settings;
   settings.no_sandbox = no_sandbox ? 1 : 0;
+  cef_color_t background = g_background_color.load();
+  if (CefColorGetA(background) == 0xFF)
+    settings.background_color = background;
   settings.windowless_rendering_enabled = 0;
   settings.persist_session_cookies = 1;
   settings.log_severity = LOGSEVERITY_WARNING;
@@ -3150,20 +3196,25 @@ void ViewContextHandler::OnRequestContextInitialized(CefRefPtr<CefRequestContext
     // fetch lisp: URLs, which only resolve where a factory is registered.
     RegisterSchemeFactories(context);
     CefBrowserSettings browser_settings;
-    browser_settings.javascript = STATE_ENABLED;
-    browser_settings.image_loading = STATE_ENABLED;
+    ConfigureBrowserBackground(browser_settings, record_->background_color);
     record_->widget = CefBrowserView::CreateBrowserView(
         new Client(record_->id), url_, browser_settings, nullptr, context,
         new BrowserViewDelegate(style_, record_->id));
+    PaintViewBackground(record_->widget, record_->background_color);
   }
   Finish();
 }
 
-int cl_cef_view_create(const char* url, int alloy, int isolated) {
+void cl_cef_set_background_color(unsigned int color) {
+  g_background_color.store(NormalizeBackground(color));
+}
+
+int cl_cef_view_create(const char* url, int alloy, int isolated, unsigned int background_color) {
   int id = AllocateId();
   auto record = std::make_shared<ViewRecord>();
   record->id = id;
   record->isolated = isolated != 0;
+  record->background_color = ResolveBackground(background_color);
   {
     std::lock_guard<std::mutex> lock(g_mu);
     g_views[id] = record;
@@ -3188,12 +3239,12 @@ int cl_cef_view_create(const char* url, int alloy, int isolated) {
       CefRequestContextSettings context_settings;
       record->context = CefRequestContext::CreateContext(context_settings, nullptr);
       CefBrowserSettings browser_settings;
-      browser_settings.javascript = STATE_ENABLED;
-      browser_settings.image_loading = STATE_ENABLED;
+      ConfigureBrowserBackground(browser_settings, record->background_color);
       record->widget = CefBrowserView::CreateBrowserView(
           new Client(record->id), initial, browser_settings, nullptr,
           record->isolated ? record->context : nullptr,
           new BrowserViewDelegate(style, record->id));
+      PaintViewBackground(record->widget, record->background_color);
     });
   }
   if (!record->widget) {
@@ -3252,6 +3303,21 @@ void cl_cef_view_destroy(int id) {
                   DropView(record);
                 }));
   });
+}
+
+void cl_cef_view_set_background_color(int id, unsigned int color) {
+  auto record = FindView(id);
+  if (!record)
+    return;
+  record->background_color = ResolveBackground(color);
+  CallUI([record]() {
+    PaintViewBackground(record->widget, record->background_color);
+  });
+}
+
+unsigned int cl_cef_view_background_color(int id) {
+  auto record = FindView(id);
+  return record ? record->background_color : 0;
 }
 
 void cl_cef_view_set_bar_height(int id, int height) {

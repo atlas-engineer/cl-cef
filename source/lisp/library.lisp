@@ -191,12 +191,23 @@
   (window-id :int)
   (view-id :int))
 
+(defcef "cl_cef_set_background_color" :void
+  (color :unsigned-int))
+
 (defcef "cl_cef_view_create" :int
   (url :string)
   (alloy :int)
-  (isolated :int))
+  (isolated :int)
+  (background-color :unsigned-int))
 
 (defcef "cl_cef_view_destroy" :void
+  (id :int))
+
+(defcef "cl_cef_view_set_background_color" :void
+  (id :int)
+  (color :unsigned-int))
+
+(defcef "cl_cef_view_background_color" :unsigned-int
   (id :int))
 
 (defcef "cl_cef_view_set_bar_height" :void

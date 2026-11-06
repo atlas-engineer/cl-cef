@@ -46,10 +46,11 @@ they would render at that zoom."))
       (if (uiop:emptyp url) "about:blank" url)
       "about:blank"))
 
-(defun install-native-view (view url)
+(defun install-native-view (view url &key (background-color 0))
   (let ((id (cl-cef-view-create (view-url-string url)
                                 (if (alloy-p view) 1 0)
-                                (if (isolated-context-p view) 1 0))))
+                                (if (isolated-context-p view) 1 0)
+                                (or background-color 0))))
     (unless (plusp id)
       (error "CEF failed to create a view."))
     (setf (slot-value view 'native-id) id)
@@ -64,11 +65,33 @@ they would render at that zoom."))
   (install-native-view view url))
 
 (export-always 'ensure-view)
-(defmethod ensure-view ((view view) &key (url "about:blank"))
-  "Create the native view when `kill' has cleared it."
+(defmethod ensure-view ((view view) &key (url "about:blank") (background-color 0))
+  "Create the native view when `kill' has cleared it.
+BACKGROUND-COLOR is an opaque ARGB integer shown before a document paints.
+0 uses the process default from `set-default-background-color'."
   (unless (web-contents view)
-    (install-native-view view url))
+    (install-native-view view url :background-color background-color))
   view)
+
+(export-always 'set-default-background-color)
+(defun set-default-background-color (color)
+  "Set the background used before a document paints.
+COLOR is an opaque ARGB integer, as in #xFF2E3440. Call this before `launch'."
+  (ensure-library)
+  (cl-cef-set-background-color (or color 0))
+  color)
+
+(export-always 'set-background-color)
+(defmethod set-background-color ((view view) color)
+  "Set the color VIEW shows before a document paints.
+COLOR is an opaque ARGB integer. 0 uses the process default."
+  (cl-cef-view-set-background-color (id view) (or color 0))
+  color)
+
+(export-always 'background-color)
+(defmethod background-color ((view view))
+  "Return the ARGB color VIEW shows before a document paints."
+  (cl-cef-view-background-color (id view)))
 
 (export-always 'kill)
 (defmethod kill ((view view))

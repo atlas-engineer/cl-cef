@@ -150,8 +150,12 @@ void cl_cef_window_add_view(int window_id, int view_id);
 void cl_cef_window_add_view_at(int window_id, int view_id, int index);
 void cl_cef_window_remove_view(int window_id, int view_id);
 
-int cl_cef_view_create(const char* url, int alloy, int isolated);
+void cl_cef_set_background_color(unsigned int color);
+
+int cl_cef_view_create(const char* url, int alloy, int isolated, unsigned int background_color);
 void cl_cef_view_destroy(int id);
+void cl_cef_view_set_background_color(int id, unsigned int color);
+unsigned int cl_cef_view_background_color(int id);
 void cl_cef_view_set_bar_height(int id, int height);
 void cl_cef_view_set_bounds(int id, int x, int y, int width, int height);
 void cl_cef_view_get_bounds(int id, int* x, int* y, int* width, int* height);
