@@ -258,6 +258,22 @@ struct HostEqual {
 
 using HostSet = std::unordered_set<std::string, HostHash, HostEqual>;
 
+struct PublishedHosts {
+  std::shared_ptr<const HostSet> load() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return hosts_;
+  }
+
+  void store(std::shared_ptr<const HostSet> hosts) {
+    std::lock_guard<std::mutex> lock(mu_);
+    hosts_ = std::move(hosts);
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::shared_ptr<const HostSet> hosts_;
+};
+
 struct ViewRecord {
   int id = 0;
   CefRefPtr<CefBrowserView> widget;
@@ -271,7 +287,7 @@ struct ViewRecord {
   std::string proxy;
   bool focused = false;
   std::atomic<bool> images{true};
-  std::atomic<std::shared_ptr<const HostSet>> blocked_hosts;
+  PublishedHosts blocked_hosts;
   bool muted = false;
   int x = 0;
   int y = 0;
@@ -2169,7 +2185,7 @@ class Client : public CefClient,
     }
     std::string url = request->GetURL().ToString();
     if (record) {
-      auto hosts = record->blocked_hosts.load(std::memory_order_acquire);
+      auto hosts = record->blocked_hosts.load();
       if (hosts && HostBlocked(*hosts, url))
         return RV_CANCEL;
     }
@@ -3686,7 +3702,7 @@ void cl_cef_view_set_blocked_hosts(int id, const char* hosts) {
   auto record = FindView(id);
   if (!record)
     return;
-  record->blocked_hosts.store(ParseBlockedHosts(hosts), std::memory_order_release);
+  record->blocked_hosts.store(ParseBlockedHosts(hosts));
 }
 
 void cl_cef_view_set_images_enabled(int id, int enabled) {
