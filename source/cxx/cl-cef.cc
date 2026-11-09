@@ -333,6 +333,8 @@ struct WindowRecord {
 
 std::mutex g_mu;
 int g_next_id = 1;
+std::atomic<int> g_keyboard_view{0};
+thread_local int g_key_forward_depth = 0;
 std::unordered_map<int, std::shared_ptr<ViewRecord>> g_views;
 std::unordered_map<int, std::shared_ptr<WindowRecord>> g_windows;
 std::unordered_map<int, int> g_browser_to_view;
@@ -478,6 +480,67 @@ std::shared_ptr<ViewRecord> FindView(int id) {
   std::lock_guard<std::mutex> lock(g_mu);
   auto found = g_views.find(id);
   return found == g_views.end() ? nullptr : found->second;
+}
+
+bool ForwardKeyToKeyboardView(int from_view, const CefKeyEvent& event) {
+  if (g_key_forward_depth > 0)
+    return false;
+  int target = g_keyboard_view.load();
+  if (target <= 0 || target == from_view)
+    return false;
+  auto dest = FindView(target);
+  auto here = FindView(from_view);
+  if (!dest || !dest->widget || !here || !here->widget)
+    return false;
+  CefRefPtr<CefWindow> dest_window = dest->widget->GetWindow();
+  CefRefPtr<CefWindow> here_window = here->widget->GetWindow();
+  if (!dest_window || !here_window || !dest_window->IsSame(here_window))
+    return false;
+  CefRefPtr<CefBrowser> browser =
+      dest->browser ? dest->browser : dest->widget->GetBrowser();
+  if (!browser || !browser->GetHost())
+    return false;
+  g_key_forward_depth++;
+  browser->GetHost()->SendKeyEvent(event);
+  if (event.type == KEYEVENT_RAWKEYDOWN && browser->GetMainFrame()) {
+    std::string edit;
+    if (event.character >= 32) {
+      char16_t unit = static_cast<char16_t>(event.character);
+      std::string utf8;
+      if (unit < 0x80) {
+        utf8.assign(1, static_cast<char>(unit));
+      } else if (unit < 0x800) {
+        utf8.push_back(static_cast<char>(0xC0 | (unit >> 6)));
+        utf8.push_back(static_cast<char>(0x80 | (unit & 0x3F)));
+      } else {
+        utf8.push_back(static_cast<char>(0xE0 | (unit >> 12)));
+        utf8.push_back(static_cast<char>(0x80 | ((unit >> 6) & 0x3F)));
+        utf8.push_back(static_cast<char>(0x80 | (unit & 0x3F)));
+      }
+      edit = "insert:" + utf8;
+    } else if (event.windows_key_code == 0x08) {
+      edit = "backspace";
+    } else if (event.windows_key_code == 0x2E) {
+      edit = "delete";
+    }
+    if (!edit.empty()) {
+      std::string script =
+          "(function(){var input=document.querySelector('#input');if(!input)return;"
+          "var value=input.value||'';var start=input.selectionStart;var end=input.selectionEnd;"
+          "if(start==null){start=value.length;end=value.length;}"
+          "var op=" + JsonString(edit) + ";"
+          "if(op.indexOf('insert:')==0){var text=op.slice(7);"
+          "input.value=value.slice(0,start)+text+value.slice(end);"
+          "var caret=start+text.length;input.selectionStart=input.selectionEnd=caret;}"
+          "else if(op=='backspace'||op=='delete'){if(start==end){if(op=='backspace'&&start>0)start--;"
+          "if(op=='delete'&&end<value.length)end++;}"
+          "input.value=value.slice(0,start)+value.slice(end);input.selectionStart=input.selectionEnd=start;}"
+          "})();";
+      browser->GetMainFrame()->ExecuteJavaScript(script, "", 0);
+    }
+  }
+  g_key_forward_depth--;
+  return true;
 }
 
 bool BrowserBelongsToView(const std::shared_ptr<ViewRecord>& view,
@@ -2073,6 +2136,8 @@ class Client : public CefClient,
     (void)browser;
     (void)os_event;
     (void)is_keyboard_shortcut;
+    if (ForwardKeyToKeyboardView(view_id_, event))
+      return true;
     if (event.type != KEYEVENT_RAWKEYDOWN && event.type != KEYEVENT_KEYUP)
       return false;
     const char* type = event.type == KEYEVENT_KEYUP ? "keyUp" : "keyDown";
@@ -3395,8 +3460,9 @@ void cl_cef_view_get_bounds(int id, int* x, int* y, int* width, int* height) {
 void cl_cef_view_focus(int id) {
   auto record = FindView(id);
   CallUI([record]() {
-    if (record && record->widget)
-      record->widget->RequestFocus();
+    if (!record || !record->widget)
+      return;
+    g_keyboard_view.store(record->id);
   });
 }
 
