@@ -500,45 +500,22 @@ bool ForwardKeyToKeyboardView(int from_view, const CefKeyEvent& event) {
       dest->browser ? dest->browser : dest->widget->GetBrowser();
   if (!browser || !browser->GetHost())
     return false;
+  CefRefPtr<CefBrowser> source =
+      here->browser ? here->browser : here->widget->GetBrowser();
   g_key_forward_depth++;
+  browser->GetHost()->SetFocus(true);
   browser->GetHost()->SendKeyEvent(event);
-  if (event.type == KEYEVENT_RAWKEYDOWN && browser->GetMainFrame()) {
-    std::string edit;
-    if (event.character >= 32) {
-      char16_t unit = static_cast<char16_t>(event.character);
-      std::string utf8;
-      if (unit < 0x80) {
-        utf8.assign(1, static_cast<char>(unit));
-      } else if (unit < 0x800) {
-        utf8.push_back(static_cast<char>(0xC0 | (unit >> 6)));
-        utf8.push_back(static_cast<char>(0x80 | (unit & 0x3F)));
-      } else {
-        utf8.push_back(static_cast<char>(0xE0 | (unit >> 12)));
-        utf8.push_back(static_cast<char>(0x80 | ((unit >> 6) & 0x3F)));
-        utf8.push_back(static_cast<char>(0x80 | (unit & 0x3F)));
-      }
-      edit = "insert:" + utf8;
-    } else if (event.windows_key_code == 0x08) {
-      edit = "backspace";
-    } else if (event.windows_key_code == 0x2E) {
-      edit = "delete";
-    }
-    if (!edit.empty()) {
-      std::string script =
-          "(function(){var input=document.querySelector('#input');if(!input)return;"
-          "var value=input.value||'';var start=input.selectionStart;var end=input.selectionEnd;"
-          "if(start==null){start=value.length;end=value.length;}"
-          "var op=" + JsonString(edit) + ";"
-          "if(op.indexOf('insert:')==0){var text=op.slice(7);"
-          "input.value=value.slice(0,start)+text+value.slice(end);"
-          "var caret=start+text.length;input.selectionStart=input.selectionEnd=caret;}"
-          "else if(op=='backspace'||op=='delete'){if(start==end){if(op=='backspace'&&start>0)start--;"
-          "if(op=='delete'&&end<value.length)end++;}"
-          "input.value=value.slice(0,start)+value.slice(end);input.selectionStart=input.selectionEnd=start;}"
-          "})();";
-      browser->GetMainFrame()->ExecuteJavaScript(script, "", 0);
-    }
+  if (event.type == KEYEVENT_RAWKEYDOWN && event.character >= 32) {
+    CefKeyEvent text = event;
+    text.type = KEYEVENT_CHAR;
+    if (text.character >= 'a' && text.character <= 'z')
+      text.windows_key_code = text.character - 'a' + 'A';
+    else
+      text.windows_key_code = text.character;
+    browser->GetHost()->SendKeyEvent(text);
   }
+  if (source && source->GetHost())
+    source->GetHost()->SetFocus(true);
   g_key_forward_depth--;
   return true;
 }
@@ -3463,6 +3440,9 @@ void cl_cef_view_focus(int id) {
     if (!record || !record->widget)
       return;
     g_keyboard_view.store(record->id);
+    CefRefPtr<CefWindow> window = record->widget->GetWindow();
+    if (window && !window->IsActive())
+      window->Activate();
   });
 }
 
