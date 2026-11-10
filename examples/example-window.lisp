@@ -15,12 +15,15 @@
     (setf (launch-options *interface*)
           (append (launch-options *interface*) '("--ozone-platform=x11"))))
   (launch *interface*)
-  (let* ((window (make-instance 'window :title "cl-cef"))
-         (view (make-instance 'view :url "https://nyxt-browser.com")))
-    (add-bounded-view window view
-                      :window-bounds-alist-var bounds
-                      :x 0
-                      :y 0
-                      :width (assoc-value bounds :width)
-                      :height (assoc-value bounds :height)))
+  (bt:make-thread
+   (lambda ()
+     (let* ((window (make-instance 'window :title "cl-cef"))
+            (view (make-instance 'view :url "https://nyxt-browser.com")))
+       (add-bounded-view window view
+                         :window-bounds-alist-var bounds
+                         :x 0
+                         :y 0
+                         :width (assoc-value bounds :width)
+                         :height (assoc-value bounds :height))))
+   :name "example window")
   (join))

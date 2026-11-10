@@ -239,8 +239,7 @@ write barrier, so that handler has to stay disabled."
        *cef-initialized-p*
        ;; On Darwin the UI thread is the process main thread, which stays
        ;; "alive" after CefShutdown. Track initialization instead.
-       #+darwin t
-       #-darwin (bt:thread-alive-p (ui-thread interface))))
+       (bt:thread-alive-p (ui-thread interface))))
 
 (defmethod (setf protocols) (value (interface interface))
   (when (alive-p interface)
@@ -517,60 +516,81 @@ CEF calls scheme handlers on its IO thread, which cannot enter Lisp.")
   (install-exit-signals)
   interface)
 
-(export-always 'launch)
-(defun launch (&optional (interface *interface*))
-  "Start CEF for INTERFACE. Return NIL when it is already running.
-
-On Darwin, `CefInitialize' runs on the calling thread (which must be the
-process main thread) and returns before the message loop starts. Call `join'
-on that same thread to enter `CefRunMessageLoop'. AppKit refuses NSWindow
-creation off the main thread, and CEF does not support
-multi_threaded_message_loop on macOS.
-
-On other platforms a background UI thread owns the message loop, and `launch'
-returns once that thread is inside it."
+(defun prepare-launch (interface)
+  "Common set-up for `launch' and `launch-in-background'.
+Return NIL when INTERFACE is already running."
   (unless interface
     (error "No CEF interface to launch."))
   (when (alive-p interface)
     (warn "CEF is already running, nothing to do.")
-    (return-from launch nil))
+    (return-from prepare-launch nil))
   (ensure-library (library-path interface))
   (cl-cef-set-event-callback (cffi:callback event-callback))
   (cl-cef-set-scheme-callback (cffi:callback scheme-callback))
   (setf *launch-error* nil)
   (setf *ui-loop-finished* (bt:make-semaphore :name "cl-cef-ui-loop-finished"))
+  t)
+
+(export-always 'launch)
+(defun launch (&optional (interface *interface*))
+  "Start CEF for INTERFACE on the calling thread. Return NIL when it is already
+running.
+
+`CefInitialize' runs on the calling thread and `launch' returns before the
+message loop starts. Call `join' on that same thread to enter
+`CefRunMessageLoop'. Work that calls into the UI thread has to run on another
+thread until then.
+
+On Linux the input method drops key events unless the message loop runs on
+the process main thread. AppKit refuses NSWindow creation off the main thread,
+and CEF does not support multi_threaded_message_loop on macOS. Call `launch'
+and `join' from the main thread. Use `launch-in-background' when that thread
+is not available."
+  (unless (prepare-launch interface)
+    (return-from launch nil))
+  (setf (slot-value interface 'ui-thread) (bt:current-thread))
+  (handler-case (initialize-cef interface)
+    (serious-condition (condition)
+      (setf *launch-error* condition)))
+  (when *launch-error*
+    (error *launch-error*))
+  (unless (alive-p interface)
+    (error "CEF failed to initialize on the calling thread."))
+  (finish-launch interface)
+  t)
+
+(export-always 'launch-in-background)
+(defun launch-in-background (&optional (interface *interface*))
+  "Start CEF for INTERFACE on a new thread. Return NIL when it is already
+running.
+
+A thread named `cl-cef ui thread' initializes CEF and owns the message loop.
+`launch-in-background' returns once that thread is inside the loop. Key events
+are dropped under a Linux input method such as IBus, because the loop does not
+run on the main thread. Use it from a REPL, whose thread cannot block in
+`join'. Not available on Darwin."
   #+darwin
-  (progn
-    (setf (slot-value interface 'ui-thread) (bt:current-thread))
-    (handler-case (initialize-cef interface)
-      (serious-condition (condition)
-        (setf *launch-error* condition)))
-    (when *launch-error*
-      (error *launch-error*))
-    (unless (alive-p interface)
-      (error "CEF failed to initialize on the main thread."))
-    (finish-launch interface)
-    (return-from launch t))
-  #-darwin
-  (progn
-    (setf *launch-ready* (bt:make-semaphore))
-    (setf (slot-value interface 'ui-thread)
-          (bt:make-thread
-           (lambda ()
-             (handler-case (start-ui-thread interface)
-               (serious-condition (condition)
-                 (format t "~&cl-cef ui thread error: ~a~%" condition)
-                 (finish-output)
-                 (setf *launch-error* condition)
-                 (bt:signal-semaphore *launch-ready*))))
-           :name "cl-cef ui thread"))
-    (bt:wait-on-semaphore *launch-ready*)
-    (when *launch-error*
-      (error *launch-error*))
-    (unless (alive-p interface)
-      (error "CEF UI thread exited during startup."))
-    (finish-launch interface)
-    t))
+  (error "CEF has to run on the main thread on Darwin. Use `launch'.")
+  (unless (prepare-launch interface)
+    (return-from launch-in-background nil))
+  (setf *launch-ready* (bt:make-semaphore))
+  (setf (slot-value interface 'ui-thread)
+        (bt:make-thread
+         (lambda ()
+           (handler-case (start-ui-thread interface)
+             (serious-condition (condition)
+               (format t "~&cl-cef ui thread error: ~a~%" condition)
+               (finish-output)
+               (setf *launch-error* condition)
+               (bt:signal-semaphore *launch-ready*))))
+         :name "cl-cef ui thread"))
+  (bt:wait-on-semaphore *launch-ready*)
+  (when *launch-error*
+    (error *launch-error*))
+  (unless (alive-p interface)
+    (error "CEF UI thread exited during startup."))
+  (finish-launch interface)
+  t)
 
 #+sbcl
 (defun install-exit-signals ()
@@ -599,17 +619,16 @@ get back to the message loop to close browsers."
 (export-always 'join)
 (defun join (&optional (interface *interface*))
   "Block until INTERFACE's CEF message loop has exited.
-On Darwin this enters `CefRunMessageLoop' on the calling thread when that
-thread is the UI thread. Otherwise it waits for that loop to finish."
+On the thread that called `launch' this enters `CefRunMessageLoop'. On any
+other thread it waits for that loop to finish."
   (unless (and interface (ui-thread interface))
     (return-from join nil))
-  #+darwin
   (if (eq (bt:current-thread) (ui-thread interface))
       (when *cef-initialized-p*
         (run-ui-message-loop interface))
-      (bt:wait-on-semaphore *ui-loop-finished*))
-  #-darwin
-  (bt:join-thread (ui-thread interface)))
+      (progn
+        (bt:wait-on-semaphore *ui-loop-finished*)
+        (bt:signal-semaphore *ui-loop-finished*))))
 
 (defun reap-helpers ()
   "Kill Chromium helpers still descended from this process.

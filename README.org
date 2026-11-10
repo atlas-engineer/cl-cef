@@ -9,7 +9,9 @@ CEF's API is C++. Common Lisp foreign calls are C, so the library is split in tw
 
 * Process model
 
-CEF runs inside the Lisp process. =launch= starts a thread named =cl-cef ui thread=, and that thread calls =CefInitialize= and then =CefRunMessageLoop=. It is the only thread that may call CEF directly. Other threads post work onto it with =within-ui-thread= (wait for the result) or =post-ui= (return immediately). =join= waits until that thread exits. =terminate= asks the message loop to quit; the UI thread then shuts CEF down.
+CEF runs inside the Lisp process. =launch= calls =CefInitialize= on the calling thread and returns. =join=, called on that same thread, enters =CefRunMessageLoop= and returns after shutdown. That thread is the only one that may call CEF directly, and until =join= runs the loop, work that calls into it has to run on another thread. Other threads post work onto it with =within-ui-thread= (wait for the result) or =post-ui= (return immediately). =terminate= asks the message loop to quit; the UI thread then shuts CEF down.
+
+On Linux the input method (IBus under GNOME) drops key events unless the loop runs on the process main thread, so call =launch= and =join= from there. =launch-in-background= starts a thread named =cl-cef ui thread= that initializes CEF and owns the loop. Use it from a REPL, accepting the dropped keys.
 
 CEF also starts its own subprocesses. The browser process points them at =cl-cef-helper=, which lives next to =libcl-cef.so= and the CEF resource files. =CefExecuteProcess= in the helper returns a non-negative status for those processes and they must exit there.
 
