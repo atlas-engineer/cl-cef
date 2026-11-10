@@ -333,8 +333,6 @@ struct WindowRecord {
 
 std::mutex g_mu;
 int g_next_id = 1;
-std::atomic<int> g_keyboard_view{0};
-thread_local int g_key_forward_depth = 0;
 std::unordered_map<int, std::shared_ptr<ViewRecord>> g_views;
 std::unordered_map<int, std::shared_ptr<WindowRecord>> g_windows;
 std::unordered_map<int, int> g_browser_to_view;
@@ -480,44 +478,6 @@ std::shared_ptr<ViewRecord> FindView(int id) {
   std::lock_guard<std::mutex> lock(g_mu);
   auto found = g_views.find(id);
   return found == g_views.end() ? nullptr : found->second;
-}
-
-bool ForwardKeyToKeyboardView(int from_view, const CefKeyEvent& event) {
-  if (g_key_forward_depth > 0)
-    return false;
-  int target = g_keyboard_view.load();
-  if (target <= 0 || target == from_view)
-    return false;
-  auto dest = FindView(target);
-  auto here = FindView(from_view);
-  if (!dest || !dest->widget || !here || !here->widget)
-    return false;
-  CefRefPtr<CefWindow> dest_window = dest->widget->GetWindow();
-  CefRefPtr<CefWindow> here_window = here->widget->GetWindow();
-  if (!dest_window || !here_window || !dest_window->IsSame(here_window))
-    return false;
-  CefRefPtr<CefBrowser> browser =
-      dest->browser ? dest->browser : dest->widget->GetBrowser();
-  if (!browser || !browser->GetHost())
-    return false;
-  CefRefPtr<CefBrowser> source =
-      here->browser ? here->browser : here->widget->GetBrowser();
-  g_key_forward_depth++;
-  browser->GetHost()->SetFocus(true);
-  browser->GetHost()->SendKeyEvent(event);
-  if (event.type == KEYEVENT_RAWKEYDOWN && event.character >= 32) {
-    CefKeyEvent text = event;
-    text.type = KEYEVENT_CHAR;
-    if (text.character >= 'a' && text.character <= 'z')
-      text.windows_key_code = text.character - 'a' + 'A';
-    else
-      text.windows_key_code = text.character;
-    browser->GetHost()->SendKeyEvent(text);
-  }
-  if (source && source->GetHost())
-    source->GetHost()->SetFocus(true);
-  g_key_forward_depth--;
-  return true;
 }
 
 bool BrowserBelongsToView(const std::shared_ptr<ViewRecord>& view,
@@ -873,6 +833,20 @@ class ViewContextHandler : public CefRequestContextHandler {
   IMPLEMENT_REFCOUNTING(ViewContextHandler);
 };
 
+void FocusView(const std::shared_ptr<ViewRecord>& record) {
+  if (!record || !record->widget)
+    return;
+  CefRefPtr<CefWindow> window = record->widget->GetWindow();
+  if (window && !window->IsActive())
+    window->Activate();
+  record->widget->SetFocusable(true);
+  record->widget->RequestFocus();
+  CefRefPtr<CefBrowser> browser =
+      record->browser ? record->browser : record->widget->GetBrowser();
+  if (browser && browser->GetHost())
+    browser->GetHost()->SetFocus(true);
+}
+
 class QueryHandler : public CefMessageRouterBrowserSide::Handler {
  public:
   explicit QueryHandler(int view_id) : view_id_(view_id) {}
@@ -883,10 +857,10 @@ class QueryHandler : public CefMessageRouterBrowserSide::Handler {
                const CefString& request,
                bool persistent,
                CefRefPtr<Callback> callback) override {
-    (void)browser;
     (void)frame;
     (void)query_id;
     (void)persistent;
+    (void)browser;
     Handle(request.ToString());
     if (callback)
       callback->Success("");
@@ -2093,13 +2067,7 @@ class Client : public CefClient,
       case IDC_FOCUS_SEARCH:
       case IDC_FOCUS_MENU_BAR:
       case IDC_FOCUS_BOOKMARKS:
-      case IDC_FOCUS_NEXT_PANE:
-      case IDC_FOCUS_PREVIOUS_PANE:
-      case IDC_FOCUS_WEB_CONTENTS_PANE:
       case IDC_FOCUS_INACTIVE_POPUP_FOR_ACCESSIBILITY:
-      case IDC_FOCUS_THIS_TAB:
-      case IDC_FOCUS_NEXT_TAB_GROUP:
-      case IDC_FOCUS_PREV_TAB_GROUP:
         return true;
       default:
         return false;
@@ -2113,8 +2081,6 @@ class Client : public CefClient,
     (void)browser;
     (void)os_event;
     (void)is_keyboard_shortcut;
-    if (ForwardKeyToKeyboardView(view_id_, event))
-      return true;
     if (event.type != KEYEVENT_RAWKEYDOWN && event.type != KEYEVENT_KEYUP)
       return false;
     const char* type = event.type == KEYEVENT_KEYUP ? "keyUp" : "keyDown";
@@ -3211,6 +3177,7 @@ void PlaceView(const std::shared_ptr<WindowRecord>& window,
     window->layout->SetFlexForView(view->widget, view->bar ? 0 : 1);
     view->flex_set = true;
   }
+  view->widget->SetFocusable(true);
   window->window->Layout();
   // Adding a browser view is when Chrome paints the product logo again.
   ApplyHostIdentity(window->window);
@@ -3388,8 +3355,6 @@ void cl_cef_view_set_bar_height(int id, int height) {
   CallUI([record]() {
     if (!record->widget)
       return;
-    // A preferred height of 0 is an empty size, and the box layout then keeps
-    // the view's own size. Hiding the view drops it from the layout.
     record->widget->SetVisible(record->bar_height > 0);
     record->widget->InvalidateLayout();
     if (auto window = record->widget->GetWindow())
@@ -3436,14 +3401,7 @@ void cl_cef_view_get_bounds(int id, int* x, int* y, int* width, int* height) {
 
 void cl_cef_view_focus(int id) {
   auto record = FindView(id);
-  CallUI([record]() {
-    if (!record || !record->widget)
-      return;
-    g_keyboard_view.store(record->id);
-    CefRefPtr<CefWindow> window = record->widget->GetWindow();
-    if (window && !window->IsActive())
-      window->Activate();
-  });
+  CallUI([record]() { FocusView(record); });
 }
 
 int cl_cef_view_is_focused(int id) {
