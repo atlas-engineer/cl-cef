@@ -206,6 +206,203 @@ example.com##.sponsor
                                              :document-url "https://ads.example/"
                                              :type :xmlhttprequest))))
 
+(define-test official-css-cosmetic-filters ()
+  (let* ((engine (adblock-from "###ccf #a1 .fail
+###ccf #a2 .fail:not(.a2)
+example.com###ccf #a3 .fail
+example.com###ccf #a4 .fail:not(.a4)
+example.com###ccf #a5 .fail:style(visibility: hidden)
+###ccf #a6 .fail-pseudo::before
+example.com###ccf #a7 .fail-pseudo::before
+example.com###ccf #a8 .fail-pseudo::before:style(visibility: hidden)
+example.com##div > .ad"))
+         (css (cef:cosmetic-css engine "https://example.com/tests/css-selector-based-cosmetic-filters.html")))
+    (dolist (selector '("#ccf #a1 .fail"
+                        "#ccf #a2 .fail:not(.a2)"
+                        "#ccf #a3 .fail"
+                        "#ccf #a4 .fail:not(.a4)"
+                        "#ccf #a6 .fail-pseudo::before"
+                        "#ccf #a7 .fail-pseudo::before"
+                        "div > .ad"))
+      (assert-true (search selector css)))
+    (assert-true (search "#ccf #a5 .fail { visibility: hidden !important }" css))
+    (assert-true (search "#ccf #a8 .fail-pseudo::before { visibility: hidden !important }" css))
+    (assert-false (search ":style(" css))))
+
+(define-test official-procedural-and-html-filters ()
+  (let* ((host "example.com")
+         (procedural
+           '(" .fail:has(b)"
+             " .fail:has(> a > b)"
+             " .fail:has(+ a > b)"
+             " .fail:has(:scope + a > b)"
+             " .fail:has(:is(.pass a > b))"
+             " .fail:not(:has(c))"
+             " .fail:has-text(needle)"
+             " .fail:has-text(/NEEDLE/i)"
+             " .fail:not(:has-text(haystack))"
+             " .fail:matches-css(position: absolute)"
+             " .fail:has(a:matches-css-before(opacity: 0))"
+             " .fail:has(b:matches-css-after(opacity: 0))"
+             " .fail > a > b:nth-ancestor(2)"
+             ":xpath(.//b/../..)"
+             " .fail:min-text-length(300)"
+             " .pass > a:has(b) + .fail"
+             " .pass > a:has(b) + .fail:has(b)"
+             " .pass:watch-attr(class) > .fail:has(b.notok)"
+             " .fail:has(+ a)"
+             " .fail:has(~ a:has(b))"
+             " .fail:remove()"
+             " b:upward(2)"
+             " b:upward(.fail)"
+             " b:upward(.fail):style(visibility: hidden !important)"))
+         (html
+           '("^#phf #a1 .fail:has(b)"
+             "^#phf #a2 .fail:has(> a > b)"
+             "^#phf #a4 .fail:has-text(needle)"
+             "^#phf #a5 .fail:has-text(/NEEDLE/i)"
+             "^#phf #a7 .fail > a > b:nth-ancestor(2)"
+             "^#phf #a8:xpath(.//b/../..)"
+             "^#phf #a9 .fail:min-text-length(300)"
+             "^#phf #a14 b:upward(2)"
+             "^#phf #a15 b:upward(.fail)"))
+         (text (with-output-to-string (stream)
+                 (loop for selector in procedural
+                       for index from 1
+                       do (format stream "~a#?##pcf #a~d~a~%" host index selector))
+                 (dolist (selector html)
+                   (format stream "~a##~a~%" host selector))))
+         (engine (adblock-from text))
+         (css (cef:cosmetic-css engine "https://example.com/pcf"))
+         (script (cef:cosmetic-script engine "https://example.com/pcf")))
+    (assert-true (search ".fail:has(b)" css))
+    (assert-true (search ":has(> a > b)" css))
+    (assert-false (search "has-text" css))
+    (assert-false (search "xpath" css))
+    (assert-true (search "hasText" script))
+    (assert-true (search "needle" script))
+    (assert-true (search "/NEEDLE/i" script))
+    (assert-true (search "haystack" script))
+    (assert-true (search "position: absolute" script))
+    (assert-true (search "::before" script))
+    (assert-true (search "::after" script))
+    (assert-true (search "upward" script))
+    (assert-true (search "xpathNodes" script))
+    (assert-true (search ".//b/../.." script))
+    (assert-true (search "minText" script))
+    (assert-true (search "300" script))
+    (assert-true (search ".fail:has(b.notok)" script))
+    (assert-true (search "drop(" script))
+    (assert-true (search "paint(" script))
+    (assert-true (search "visibility: hidden !important" script))
+    (assert-true (search "#phf #a1" script))
+    (assert-true (search "MutationObserver" script))))
+
+(define-test official-nostif-scriptlet ()
+  (let ((cases '(("example.com##+js(nostif, bad)" "bad" "")
+                 ("example.com##+js(nostif, !good)" "!good" "")
+                 ("example.com##+js(nostif, , 33)" "" "33")
+                 ("example.com##+js(nostif, , !66)" "" "!66")
+                 ("example.com##+js(nostif, bad, 33)" "bad" "33")
+                 ("example.com##+js(nostif, !good, !66)" "!good" "!66")
+                 ("example.com##+js(nostif, bad, !33)" "bad" "!33")
+                 ("example.com##+js(nostif, !good, 66)" "!good" "66")
+                 ("example.com##+js(nostif, !bad, 33)" "!bad" "33")
+                 ("example.com##+js(nostif, good, !66)" "good" "!66"))))
+    (dolist (case cases)
+      (destructuring-bind (line needle delay) case
+        (let* ((engine (adblock-from line))
+               (script (cef:cosmetic-script engine "https://example.com/sif")))
+          (assert-true (search "installNostif" script))
+          (assert-true (search (format nil "installNostif(~s,~s)" needle delay) script))
+          (assert-false (search "installNostif" (cef:cosmetic-css engine "https://example.com/sif"))))))))
+
+(defparameter *parser-checklist-accept*
+  '("a*"
+    "*$xhr"
+    "|*$xhr"
+    "|$xhr"
+    "||*$xhr"
+    "||$xhr"
+    "||*|$xhr"
+    ":: ab"
+    ":: AB"
+    ":: ab # comment"
+    "0.0.0.0 0.0.0.0.example.com"
+    "0.0.0.0 localhost.example.com"
+    "0.0.0.0 local-host.example.com"
+    "0.0.0.0 local.com"
+    "0.0.0.0 localhost.com"
+    "0.0.0.0 local-host.com"
+    "$script,redirect=noop.js"
+    "*$redirect=noop.js"
+    "*$empty"
+    "*$xhr,empty"
+    "*$xhr,redirect=empty"
+    "*$csp=default-src 'none'"
+    "*$all,~document"
+    "*$all,~popup"
+    "*$all,~inline-script"
+    "*$all,~inline-font"
+    "*$domain=toto.com|toto.*|~toto.com|~toto.*|tôtó.ça|tôtó.*|~tôtó.ça|[ff00::0]|1.1.1.1"
+    "*$denyallow=toto.com|tôtó.ça|[ff00::0]|1.1.1.1,domain=toto.com"))
+
+(defparameter *parser-checklist-reject*
+  '("a"
+    "|"
+    "||"
+    "$"
+    "*"
+    "|*"
+    "||*"
+    "||*|"
+    ":: a"
+    ":: ab/"
+    ":: ab/ # comment"
+    "::/ ab"
+    ":: ab$"
+    "0.0.0.0 0.0.0.0"
+    "0.0.0.0 local"
+    "0.0.0.0 localhost"
+    "/(abc|def/$xhr"
+    "*$beacon,redirect-rule=empty"
+    "*$ping,redirect-rule=empty"
+    "*$websocket,redirect-rule=empty"
+    "*$ghide,redirect=noop.js"
+    "*$csp=default-src 'none',empty"
+    "*$csp=default-src 'none',redirect=empty"
+    "*$redirect=empty,csp=default-src 'none'"
+    "*$csp=default-src 'none',xhr"
+    "*$csp=default-src 'none',ghide"
+    "*$csp=default-src 'none',csp=script-src 'none'"
+    "*$~document"
+    "*$~popup"
+    "*$~inline-script"
+    "*$~inline-font"
+    "*$domain=.toto.com|toto.com.|[ff00::00000]|1.1.1.1111"
+    "*$denyallow=.toto.com|toto.com.|toto.*|~toto.com|~toto.*|[ff00::00000]|1.1.1.1111,domain=toto.com"
+    "*$script,denyallow=toto.com"))
+
+(define-test official-static-filtering-parser-checklist ()
+  (let* ((text (with-output-to-string (stream)
+                 (dolist (line *parser-checklist-accept*)
+                   (write-line line stream))
+                 (dolist (line *parser-checklist-reject*)
+                   (write-line line stream))))
+         (engine (adblock-from text)))
+    (dolist (line *parser-checklist-accept*)
+      (assert-true (cef:filter-parsed-p engine line)))
+    (dolist (line *parser-checklist-reject*)
+      (assert-false (cef:filter-parsed-p engine line)))
+    (let ((hosts (adblock-from ":: ab
+:: AB
+0.0.0.0 localhost.example.com
+0.0.0.0 localhost")))
+      (assert-true (cef:blocked-p hosts "http://ab/x" :type :script))
+      (assert-true (cef:blocked-p hosts "https://localhost.example.com/a" :type :script))
+      (assert-false (cef:blocked-p hosts "https://localhost/a" :type :script))
+      (assert-false (cef:filter-parsed-p hosts "0.0.0.0 localhost")))))
+
 (define-test indexed-host-rules-do-not-match-unrelated-urls ()
   (let ((engine (make-instance 'cef:adblocker)))
     (cef:load-filters

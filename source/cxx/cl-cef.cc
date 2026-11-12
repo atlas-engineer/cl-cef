@@ -568,13 +568,21 @@ double LevelToFactor(double level) {
 void ApplyCss(CefRefPtr<CefFrame> frame, const std::string& key, const std::string& css) {
   if (!frame)
     return;
-  std::string script =
+  const char separator = '\x1e';
+  auto split = css.find(separator);
+  std::string style = split == std::string::npos ? css : css.substr(0, split);
+  std::string script = split == std::string::npos ? std::string() : css.substr(split + 1);
+  if (!script.empty())
+    frame->ExecuteJavaScript(script, frame->GetURL(), 0);
+  if (style.empty())
+    return;
+  std::string inject =
       "(()=>{var id=" + JsonString(key) +
       ";var node=document.getElementById(id);"
       "if(!node){node=document.createElement('style');node.id=id;"
       "(document.head||document.documentElement).appendChild(node);}"
-      "node.textContent=" + JsonString(css) + ";})()";
-  frame->ExecuteJavaScript(script, frame->GetURL(), 0);
+      "node.textContent=" + JsonString(style) + ";})()";
+  frame->ExecuteJavaScript(inject, frame->GetURL(), 0);
 }
 
 void ApplyScripts(const std::shared_ptr<ViewRecord>& view,
@@ -1371,6 +1379,67 @@ class BodyReplaceFilter : public CefResponseFilter {
   IMPLEMENT_REFCOUNTING(BodyReplaceFilter);
 };
 
+// Runs the adblock script before any page script. OnLoadStart's
+// ExecuteJavaScript is queued and can lose that race.
+class ScriptPrefixFilter : public CefResponseFilter {
+ public:
+  explicit ScriptPrefixFilter(std::string script) : script_(std::move(script)) {
+    prefix_ = "<script>";
+    for (size_t index = 0; index < script_.size(); ++index) {
+      if (script_[index] == '<' && index + 1 < script_.size() && script_[index + 1] == '/') {
+        prefix_ += "<\\/";
+        ++index;
+      } else {
+        prefix_.push_back(script_[index]);
+      }
+    }
+    prefix_ += "</script>";
+  }
+
+  bool InitFilter() override { return !prefix_.empty(); }
+
+  FilterStatus Filter(void* data_in,
+                      size_t data_in_size,
+                      size_t& data_in_read,
+                      void* data_out,
+                      size_t data_out_size,
+                      size_t& data_out_written) override {
+    if (!data_out || data_out_size == 0)
+      return RESPONSE_FILTER_ERROR;
+    data_in_read = 0;
+    data_out_written = 0;
+    if (!sent_) {
+      size_t take = std::min(prefix_.size() - prefix_sent_, data_out_size);
+      if (take > 0) {
+        std::memcpy(data_out, prefix_.data() + prefix_sent_, take);
+        prefix_sent_ += take;
+        data_out_written += take;
+      }
+      if (prefix_sent_ < prefix_.size())
+        return RESPONSE_FILTER_NEED_MORE_DATA;
+      sent_ = true;
+    }
+    size_t room = data_out_size - data_out_written;
+    size_t copy = std::min(data_in_size, room);
+    if (copy > 0 && data_in) {
+      std::memcpy(static_cast<char*>(data_out) + data_out_written, data_in, copy);
+      data_in_read = copy;
+      data_out_written += copy;
+    }
+    if (data_in_read < data_in_size)
+      return RESPONSE_FILTER_NEED_MORE_DATA;
+    return RESPONSE_FILTER_DONE;
+  }
+
+ private:
+  std::string script_;
+  std::string prefix_;
+  size_t prefix_sent_ = 0;
+  bool sent_ = false;
+
+  IMPLEMENT_REFCOUNTING(ScriptPrefixFilter);
+};
+
 // Returns true when the request should be cancelled. CSS is filled for every
 // call that reaches Lisp, including an empty sheet, so a later navigation can
 // replace an older one for the same host.
@@ -2002,6 +2071,9 @@ class Client : public CefClient,
     if (!view || view->destroying)
       return;
     ApplyScripts(view, frame, false);
+    std::string cosmetic = CosmeticFor(frame->GetURL().ToString());
+    if (!cosmetic.empty())
+      ApplyCss(frame, "cl-cef-adblock", cosmetic);
     if (!frame->IsMain())
       return;
     Emit(view_id_,
@@ -2227,14 +2299,18 @@ class Client : public CefClient,
     if (!request)
       return nullptr;
     auto replacements = ParseReplacements(ReplacementsText(request->GetIdentifier()));
-    if (replacements.empty())
-      return nullptr;
     std::string mime = response ? response->GetMimeType().ToString() : std::string();
     for (char& character : mime)
       character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-    if (BinaryMime(mime))
-      return nullptr;
-    return new BodyReplaceFilter(std::move(replacements));
+    if (!replacements.empty() && !BinaryMime(mime))
+      return new BodyReplaceFilter(std::move(replacements));
+    if (request->GetResourceType() == RT_MAIN_FRAME && !BinaryMime(mime)) {
+      std::string cosmetic = CosmeticFor(request->GetURL().ToString());
+      auto split = cosmetic.find('\x1e');
+      if (split != std::string::npos && split + 1 < cosmetic.size())
+        return new ScriptPrefixFilter(cosmetic.substr(split + 1));
+    }
+    return nullptr;
   }
 
   void OnResourceLoadComplete(CefRefPtr<CefBrowser> browser,

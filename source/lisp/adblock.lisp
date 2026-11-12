@@ -5,11 +5,11 @@
 ;;;;
 ;;;; Network filters are indexed by hostname or by a literal token, which is
 ;;;; what keeps a full EasyList match off the linear scan. Cosmetic filters
-;;;; become one stylesheet per page. A literal `$replace' rewrites the response
-;;;; body instead of blocking the request. Scriptlets, HTML filters, regex
-;;;; `$replace', and the other modifiers that do not block (`$csp',
-;;;; `$removeparam', `$rewrite', `$header') are skipped: applying them as
-;;;; blocks would change their meaning.
+;;;; become one stylesheet per page. Procedural operators, `##^' HTML filters,
+;;;; and `##+js(nostif)' run as a script beside that sheet. A literal
+;;;; `$replace' rewrites the response body. `$csp' is parsed and does not
+;;;; block. Regex `$replace', `$removeparam', `$rewrite', and `$header' are
+;;;; not applied as blocks.
 ;;;;
 ;;;; YouTube's pre-roll is decided before the video starts, from `adPlacements'
 ;;;; and `adSlots' in the player response. Firefox uBlock Origin renames those
@@ -75,10 +75,8 @@
 A host under one of these shares a site with its sibling subdomains.")
 
 (defparameter *unsupported-selector-markers*
-  '(":has-text" ":matches-css" ":matches-attr" ":xpath(" ":upward("
-    ":nth-ancestor" ":min-text-length" ":watch-attr" ":remove-attr"
-    ":remove-class" ":remove(" ":style(" ":-abp-contains" ":contains(" "+js(")
-  "Cosmetic syntax that is not CSS. One bad selector voids the whole rule.")
+  '(":matches-attr" ":remove-attr" ":remove-class" ":-abp-contains" ":contains(")
+  "Cosmetic syntax this engine does not run. One of these drops the selector.")
 
 (defparameter *default-filter-list-max-age* (* 4 24 60 60)
   "Seconds before a cached default list is downloaded again.")
@@ -576,8 +574,8 @@ contains another one, and that is still a plain filter."
 (defun unsupported-option-p (options)
   (some (lambda (marker)
           (search marker options))
-        '("csp=" "removeparam=" "rewrite=" "redirect-rule" "header=" "method="
-          "permissions=" "denyallow=" "urlskip=" "reason=" "queryprune=")))
+        '("removeparam=" "rewrite=" "redirect-rule" "header=" "method="
+          "permissions=" "urlskip=" "reason=" "queryprune=")))
 
 (defun replace-metacharacter-p (char)
   "Characters that make a `$replace' pattern a regular expression."
@@ -619,6 +617,91 @@ text, so those options are refused and the filter is dropped."
           (when tokens
             (format nil "$~{~a~^,~}" (sort (copy-list tokens) #'string<)))))
 
+(defun wildcard-only-p (pattern)
+  (or (zerop (length pattern))
+      (every (lambda (char) (member char '(#\* #\| #\^))) pattern)))
+
+(defun regex-compilable-p (source flags)
+  (handler-case
+      (progn
+        (ppcre:create-scanner source :case-insensitive-mode (find #\i flags))
+        t)
+    (error ()
+      nil)))
+
+(defun valid-ipv4-p (text)
+  (let ((parts (split-by #\. text)))
+    (and (= (length parts) 4)
+         (every (lambda (part)
+                  (and (plusp (length part))
+                       (every #'digit-char-p part)
+                       (<= (parse-integer part) 255)))
+                parts))))
+
+(defun valid-ipv6-p (text)
+  (and (plusp (length text))
+       (not (search ":::" text))
+       (every (lambda (part)
+                (or (zerop (length part))
+                    (and (<= (length part) 4)
+                         (every (lambda (char) (digit-char-p char 16)) part))))
+              (split-by #\: text))
+       (let ((groups (count-if (lambda (part) (plusp (length part))) (split-by #\: text))))
+         (if (search "::" text)
+             (<= groups 7)
+             (= (length (split-by #\: text)) 8)))))
+
+(defun valid-hostname-labels-p (host)
+  (let ((labels (split-by #\. host)))
+    (and labels
+         (not (find "" labels :test #'string=))
+         (>= (length (first (last labels))) 2)
+         (every (lambda (label)
+                  (and (not (char= (char label 0) #\-))
+                       (not (char= (char label (1- (length label))) #\-))
+                       (every (lambda (char)
+                                (or (alphanumericp char) (char= char #\-)))
+                              label)))
+                labels))))
+
+(defun valid-domain-token-p (token)
+  (cond
+    ((or (null token) (zerop (length token))) nil)
+    ((char= (char token 0) #\~)
+     (valid-domain-token-p (subseq token 1)))
+    ((or (char= (char token 0) #\.)
+         (char= (char token (1- (length token))) #\.))
+     nil)
+    ((and (char= (char token 0) #\[)
+          (char= (char token (1- (length token))) #\]))
+     (valid-ipv6-p (subseq token 1 (1- (length token)))))
+    ((ppcre:scan "^[0-9.]+$" token)
+     (valid-ipv4-p token))
+    ((and (alexandria:ends-with-subseq ".*" token) (> (length token) 2))
+     (valid-hostname-labels-p (subseq token 0 (- (length token) 2))))
+    (t (valid-hostname-labels-p token))))
+
+(defun valid-domain-list-p (value)
+  (and value
+       (plusp (length value))
+       (every #'valid-domain-token-p (split-by #\| value))))
+
+(defun valid-denyallow-token-p (token)
+  (and (plusp (length token))
+       (not (char= (char token 0) #\~))
+       (not (alexandria:ends-with-subseq ".*" token))
+       (valid-domain-token-p token)))
+
+(defun valid-denyallow-list-p (value)
+  (and value
+       (plusp (length value))
+       (every #'valid-denyallow-token-p (split-by #\| value))))
+
+(defun negated-standalone-p (key negated)
+  (and negated
+       (member key '("document" "doc" "popup" "popunder" "inline-script" "inline-font")
+               :test #'string=)))
+
 (defun parse-network-filter (line)
   "Parse one network filter. Returns :badfilter and a key, :filter and a filter, or NIL."
   (let* ((exception (alexandria:starts-with-subseq "@@" line))
@@ -626,6 +709,14 @@ text, so those options are refused and the filter is dropped."
     (multiple-value-bind (body options) (split-filter-options rest)
       (when (and options (unsupported-option-p options))
         (return-from parse-network-filter nil))
+      (when (find-if (lambda (char) (member char '(#\Space #\Tab))) body)
+        (return-from parse-network-filter nil))
+      (when (and (or (null options) (zerop (length options)))
+                 (or (<= (length body) 1) (wildcard-only-p body)))
+        (return-from parse-network-filter nil))
+      (let ((regex (regex-parts body)))
+        (when (and regex (not (regex-compilable-p (car regex) (cdr regex))))
+          (return-from parse-network-filter nil)))
       (let ((mask (if exception +default-exception-mask+ +default-block-mask+))
             (explicit nil)
             (tokens nil)
@@ -638,7 +729,17 @@ text, so those options are refused and the filter is dropped."
             (important nil)
             (match-case nil)
             (replacements nil)
-            (unknown nil))
+            (unknown nil)
+            (csp-count 0)
+            (saw-type nil)
+            (saw-redirect nil)
+            (saw-empty nil)
+            (saw-ghide nil)
+            (saw-domain nil)
+            (denyallow-p nil)
+            (other-positive nil)
+            (negated-special nil)
+            (bad-domain nil))
         (dolist (raw (if options (split-by #\, options) nil))
           (let* ((text (string-trim '(#\Space #\Tab) raw))
                  (negated (and (plusp (length text)) (char= (char text 0) #\~)))
@@ -652,13 +753,38 @@ text, so those options are refused and the filter is dropped."
               ((string= key "important") (setf important (not negated)))
               ((string= key "match-case") (setf match-case (not negated)))
               ((or (string= key "domain") (string= key "from"))
+               (setf saw-domain t
+                     other-positive t)
+               (unless (valid-domain-list-p value)
+                 (setf bad-domain t))
                (multiple-value-bind (yes no) (parse-domain-list value)
                  (setf domains yes excluded no))
                (push (format nil "domain=~a" (string-downcase (or value ""))) tokens))
               ((string= key "to")
+               (setf other-positive t)
+               (unless (valid-domain-list-p value)
+                 (setf bad-domain t))
                (multiple-value-bind (yes no) (parse-domain-list value)
                  (setf to-domains yes to-excluded no))
                (push (format nil "to=~a" (string-downcase (or value ""))) tokens))
+              ((string= key "denyallow")
+               (setf denyallow-p t
+                     other-positive t)
+               (if (and value (not negated) (valid-denyallow-list-p value))
+                   (setf to-excluded (append (split-by #\| (string-downcase value))
+                                             to-excluded))
+                   (setf unknown t)))
+              ((string= key "csp")
+               (incf csp-count)
+               (setf other-positive t)
+               (when (or negated (not value) (zerop (length value)))
+                 (setf unknown t)))
+              ((member key '("inline-script" "inline-font" "popunder") :test #'string=)
+               (when value
+                 (setf unknown t))
+               (if negated
+                   (setf negated-special t)
+                   (setf other-positive t)))
               ((string= key "replace")
                (let ((parsed (parse-replace-value value)))
                  (unless parsed
@@ -667,20 +793,33 @@ text, so those options are refused and the filter is dropped."
                    (setf replacements (append replacements (list parsed)))
                    (push (format nil "replace=~a" (string-downcase (or value ""))) tokens))))
               ((member key '("redirect" "empty") :test #'string=)
+               (setf other-positive t)
+               (if (string= key "empty")
+                   (setf saw-empty t)
+                   (setf saw-redirect t))
                (push (if value (format nil "~a=~a" key value) key) tokens))
               ((or (string= key "third-party") (string= key "3p"))
-               (setf party (if negated :first :third))
+               (setf other-positive t
+                     party (if negated :first :third))
                (push (if negated "~third-party" "third-party") tokens))
               ((or (string= key "first-party") (string= key "1p"))
-               (setf party (if negated :third :first))
+               (setf other-positive t
+                     party (if negated :third :first))
                (push (if negated "~first-party" "first-party") tokens))
               ((string= key "strict3p")
-               (setf party (if negated :strict-first :strict-third))
+               (setf other-positive t
+                     party (if negated :strict-first :strict-third))
                (push (if negated "~strict3p" "strict3p") tokens))
               ((string= key "strict1p")
-               (setf party (if negated :strict-third :strict-first))
+               (setf other-positive t
+                     party (if negated :strict-third :strict-first))
                (push (if negated "~strict1p" "strict1p") tokens))
               ((pseudo-bit key)
+               (when (member key '("generichide" "ghide" "elemhide" "ehide"
+                                   "specificelemhide" "shide")
+                             :test #'string=)
+                 (setf saw-ghide t))
+               (setf other-positive t)
                (let ((bit (pseudo-bit key)))
                  ;; A positive type replaces the default mask. A negation only
                  ;; clears that bit, so `$~script' still matches images.
@@ -694,6 +833,10 @@ text, so those options are refused and the filter is dropped."
                     (setf mask (logior mask bit)))))
                (push (if negated (concatenate 'string "~" key) key) tokens))
               ((option-type key)
+               (setf saw-type t)
+               (if (negated-standalone-p key negated)
+                   (setf negated-special t)
+                   (setf other-positive t))
                (let* ((type (option-type key))
                       (bit (if (eq type :all) +network-mask+ (type-bit type))))
                  (cond
@@ -712,6 +855,17 @@ text, so those options are refused and the filter is dropped."
                        tokens)))
               ((not (known-bare-option-p key))
                (setf unknown t)))))
+        (when (and (plusp csp-count)
+                   (or (> csp-count 1) saw-type saw-redirect saw-empty saw-ghide))
+          (setf unknown t))
+        (when (and saw-redirect saw-ghide)
+          (setf unknown t))
+        (when (and denyallow-p (not saw-domain))
+          (setf unknown t))
+        (when bad-domain
+          (setf unknown t))
+        (when (and negated-special (not other-positive) (wildcard-only-p body))
+          (setf unknown t))
         (when unknown
           (return-from parse-network-filter nil))
         (when important
@@ -745,7 +899,8 @@ text, so those options are refused and the filter is dropped."
                          :important-p important
                          :host-key host
                          :token-key (unless host token)
-                         :replacements replacements)))))))))
+                         :replacements replacements
+                         :active-p (zerop csp-count))))))))))
 
 (defun normalize-selector (selector)
   (let ((text (string-trim '(#\Space #\Tab #\Return) selector)))
@@ -759,12 +914,9 @@ text, so those options are refused and the filter is dropped."
 
 (defun usable-selector-p (selector)
   (and (plusp (length selector))
-       (not (char= (char selector 0) #\^))
-       (not (char= (char selector 0) #\+))
        (not (find #\{ selector))
        (not (find #\} selector))
        (not (find #\< selector))
-       (not (find #\> selector))
        (not (search ":-abp-" selector))
        (not (some (lambda (marker) (search marker selector))
                   *unsupported-selector-markers*))))
@@ -840,6 +992,32 @@ text, so those options are refused and the filter is dropped."
   (badfilters nil :type list)
   (cosmetics nil :type list))
 
+(defvar *accepted-lines* nil
+  "Lines accepted by the parse currently in progress.")
+
+(defparameter *hostname-scanner*
+  (ppcre:create-scanner
+   "^(?:[0-9a-z][0-9a-z_-]*\\.)*[0-9a-z][0-9a-z-]*[0-9a-z]$"))
+
+(defparameter *hosts-redirect-scanner*
+  (ppcre:create-scanner
+   "^(?:0\\.0\\.0\\.0|broadcasthost|local|localhost(?:\\.localdomain)?|ip6-\\w+)$"))
+
+(defun hosts-verdict (line)
+  "Values are :block and a hostname, :ignore, or NIL when LINE is not a hosts entry."
+  (let* ((cut (search " #" line))
+         (body (if cut (subseq line 0 cut) line)))
+    (multiple-value-bind (match groups)
+        (ppcre:scan-to-strings "^([\\w%.:\\[\\]-]+)[ \\t]+(\\S+)$" body)
+      (declare (ignore match))
+      (unless groups
+        (return-from hosts-verdict nil))
+      (let ((host (string-downcase (aref groups 1))))
+        (cond
+          ((ppcre:scan *hosts-redirect-scanner* host) :ignore)
+          ((ppcre:scan *hostname-scanner* host) (values :block host))
+          (t :ignore))))))
+
 (defun parse-filter-stream (stream &optional directory seen)
   (let ((batch (make-parsed-batch))
         (stack nil)
@@ -888,19 +1066,35 @@ text, so those options are refused and the filter is dropped."
                              (plusp (length line))
                              (not (char= (char line 0) #\!))
                              (not (char= (char line 0) #\[)))
-                    (let ((cosmetic (parse-cosmetic-filter line)))
-                      (cond
-                        (cosmetic
-                         (push cosmetic (parsed-batch-cosmetics batch)))
-                        ;; A cosmetic anchor that we cannot apply (`##+js`, `:has-text')
-                        ;; must not fall through and block URLs that contain the line.
-                        ((nth-value 2 (cosmetic-anchor line)))
-                        (t
-                         (multiple-value-bind (parsed-kind payload) (parse-network-filter line)
-                           (case parsed-kind
-                             (:filter (push payload (parsed-batch-filters batch)))
-                             (:badfilter (push payload (parsed-batch-badfilters batch)))))))))))))
+                    (accept-filter-line batch line))))))
     batch))
+
+(defun accept-filter-line (batch line)
+  (multiple-value-bind (hosts-kind host) (hosts-verdict line)
+    (cond
+      ((eq hosts-kind :block)
+       (multiple-value-bind (parsed-kind payload)
+           (parse-network-filter (format nil "||~a^" host))
+         (when (eq parsed-kind :filter)
+           (push payload (parsed-batch-filters batch))
+           (push line *accepted-lines*))))
+      ((eq hosts-kind :ignore))
+      (t
+       (let ((cosmetic (parse-cosmetic-filter line)))
+         (cond
+           (cosmetic
+            (push cosmetic (parsed-batch-cosmetics batch))
+            (push line *accepted-lines*))
+           ((nth-value 2 (cosmetic-anchor line)))
+           (t
+            (multiple-value-bind (parsed-kind payload) (parse-network-filter line)
+              (case parsed-kind
+                (:filter
+                 (push payload (parsed-batch-filters batch))
+                 (push line *accepted-lines*))
+                (:badfilter
+                 (push payload (parsed-batch-badfilters batch))
+                 (push line *accepted-lines*)))))))))))
 
 (defun parse-filter-text (text &optional directory)
   (with-input-from-string (stream text)
@@ -944,7 +1138,10 @@ text, so those options are refused and the filter is dropped."
    (generation
     0
     :type integer
-    :documentation "Bumped on each match so a filter is tested once."))
+    :documentation "Bumped on each match so a filter is tested once.")
+   (parsed-lines
+    (make-hash-table :test 'equal)
+    :documentation "Filter lines that parsed, including modifiers that do not block."))
   (:export-class-name-p t)
   (:documentation "Engine for uBlock Origin and Adblock Plus filter lists.
 `load-filters' reads lists. `blocked-p' answers a request. `enable' installs
@@ -989,6 +1186,8 @@ default lists."))
         (index-filter adblocker filter)))
     (dolist (rule (parsed-batch-cosmetics batch))
       (index-cosmetic adblocker rule))
+    (dolist (line *accepted-lines*)
+      (setf (gethash line (parsed-lines adblocker)) t))
     (clrhash (css-cache adblocker))
     (clrhash (genericblock-cache adblocker)))
   (reset-adblock-cosmetic)
@@ -1105,15 +1304,23 @@ default lists."))
                (funcall (network-filter-matcher filter) url folded)))
         (page-exceptions adblocker)))
 
+(defun hide-selector-p (selector)
+  (and (plusp (length selector))
+       (not (char= (char selector 0) #\^))
+       (not (alexandria:starts-with-subseq "+js(" selector))
+       (not (contains-procedural-p selector))))
+
 (defun selectors-to-css (selectors)
   (if (null selectors)
       ""
       (with-output-to-string (stream)
-        (loop while selectors
-              for chunk = (loop repeat 500
-                                while selectors
-                                collect (pop selectors))
-              do (format stream "~{~a~^,~} { display: none !important; }~%" chunk)))))
+        (dolist (selector selectors)
+          (let ((style (pure-style-rule selector)))
+            (cond
+              (style
+               (format stream "~a { ~a }~%" (car style) (cdr style)))
+              ((hide-selector-p selector)
+               (format stream "~a { display: none !important; }~%" selector))))))))
 
 (defun matching-selectors (rules host excluded)
   (let ((found nil))
@@ -1136,15 +1343,31 @@ default lists."))
         (setf (gethash (cosmetic-rule-selector rule) table) t)))
     table))
 
-(defun build-cosmetic-css (adblocker url)
+(defun script-for-selectors (selectors)
+  (let ((immediate nil)
+        (jobs nil))
+    (dolist (selector selectors)
+      (let ((scriptlet (scriptlet-statement selector)))
+        (cond
+          (scriptlet (push scriptlet immediate))
+          ((and (plusp (length selector)) (char= (char selector 0) #\^))
+           (let ((statement (cosmetic-statement selector :remove)))
+             (when statement
+               (push statement jobs))))
+          ((and (contains-procedural-p selector) (not (pure-style-rule selector)))
+           (let ((statement (cosmetic-statement selector :hide)))
+             (when statement
+               (push statement jobs)))))))
+    (wrap-page-script (nreverse immediate) (nreverse jobs))))
+
+(defun build-cosmetic (adblocker url)
+  "A cons of the stylesheet and the procedural script for URL."
   (let* ((url (strip-fragment url))
          (folded (string-downcase url))
          (host (or (url-host folded) ""))
          (elemhide (page-flag-p adblocker url folded host +elemhide-bit+))
          (generichide (page-flag-p adblocker url folded host +generichide-bit+))
          (specific (page-flag-p adblocker url folded host +specificelemhide-bit+))
-         ;; The sheet depends on the host and on which hide-exceptions matched.
-         ;; Keying that way shares one copy across every URL on the host.
          (key (format nil "~a|~:[~;e~]~:[~;g~]~:[~;s~]"
                       host elemhide generichide specific))
          (cached (gethash key (css-cache adblocker))))
@@ -1154,19 +1377,29 @@ default lists."))
           (when (> (hash-table-count (css-cache adblocker)) 256)
             (clrhash (css-cache adblocker)))
           (setf (gethash key (css-cache adblocker))
-                (if elemhide
-                    ""
-                    (let ((excluded (excluded-selectors (specific-rules adblocker) host))
-                          (selectors nil))
-                      (unless generichide
-                        (dolist (selector (generic-selectors adblocker))
-                          (unless (gethash selector excluded)
-                            (push selector selectors))))
-                      (unless specific
-                        (setf selectors
-                              (nconc (matching-selectors (specific-rules adblocker) host excluded)
-                                     selectors)))
-                      (selectors-to-css selectors))))))))
+                (let ((excluded (excluded-selectors (specific-rules adblocker) host))
+                      (css-selectors nil)
+                      (script-selectors nil))
+                  (flet ((consider (selector generic-p)
+                           (unless (gethash selector excluded)
+                             (when (scriptlet-parts selector)
+                               (push selector script-selectors))
+                             (unless (or elemhide
+                                         (and generic-p generichide)
+                                         (and (not generic-p) specific))
+                               (push selector css-selectors)
+                               (when (and (not (scriptlet-parts selector))
+                                          (or (and (plusp (length selector))
+                                                   (char= (char selector 0) #\^))
+                                              (and (contains-procedural-p selector)
+                                                   (not (pure-style-rule selector)))))
+                                 (push selector script-selectors))))))
+                    (dolist (selector (generic-selectors adblocker))
+                      (consider selector t))
+                    (dolist (selector (matching-selectors (specific-rules adblocker) host excluded))
+                      (consider selector nil))
+                    (cons (selectors-to-css css-selectors)
+                          (or (script-for-selectors script-selectors) "")))))))))
 
 (defun add-replacement (pairs pair)
   (if (member pair pairs :test #'equal)
@@ -1282,16 +1515,40 @@ TYPE is a keyword such as :script, :image, :document, :subdocument, or
 (defmethod cosmetic-css ((adblocker adblocker) url)
   "Stylesheet that hides elements on the page URL. Empty when there is nothing to hide."
   (bt:with-recursive-lock-held ((update-lock adblocker))
-    (build-cosmetic-css adblocker url)))
+    (car (build-cosmetic adblocker url))))
+
+(export-always 'cosmetic-script)
+(defmethod cosmetic-script ((adblocker adblocker) url)
+  "Page script for procedural filters, HTML filters, and scriptlets on URL.
+Empty when the page needs none."
+  (bt:with-recursive-lock-held ((update-lock adblocker))
+    (cdr (build-cosmetic adblocker url))))
+
+(defun cosmetic-payload (adblocker url)
+  "Stylesheet and page script joined for the renderer.
+A unit separator divides them. The script is absent when there is nothing to run."
+  (bt:with-recursive-lock-held ((update-lock adblocker))
+    (let ((sheet (build-cosmetic adblocker url)))
+      (if (plusp (length (cdr sheet)))
+          (concatenate 'string (car sheet) (string (code-char 30)) (cdr sheet))
+          (car sheet)))))
+
+(export-always 'filter-parsed-p)
+(defmethod filter-parsed-p ((adblocker adblocker) line)
+  "Whether LINE was accepted as a filter. A comment or a rejected line is false."
+  (bt:with-recursive-lock-held ((update-lock adblocker))
+    (and (gethash (clean-line line) (parsed-lines adblocker)) t)))
 
 (export-always 'load-filters)
 (defgeneric load-filters (adblocker source)
   (:documentation "Add uBlock Origin and Adblock Plus filters from SOURCE.
 SOURCE is a filter list string, a pathname, a stream, or a list of those.
-A literal `$replace' rewrites the response. Scriptlets, regex `$replace', and
-modifiers that rewrite a request instead of blocking it are skipped.")
+A literal `$replace' rewrites the response. Procedural cosmetic filters, HTML
+filters, and `##+js(nostif)' run in the page. Regex `$replace' and modifiers
+that rewrite a request instead of blocking it are not applied as blocks.")
   (:method ((adblocker adblocker) (source string))
-    (commit-batch adblocker (parse-filter-text source)))
+    (let ((*accepted-lines* nil))
+      (commit-batch adblocker (parse-filter-text source))))
   (:method ((adblocker adblocker) (source pathname))
     (with-open-file (stream source :external-format :utf-8)
       (let ((name (ignore-errors (namestring (truename source)))))
@@ -1372,7 +1629,7 @@ A download failure falls back to the cached copy of that list."
           (values t "" "")
           (values nil
                   (if (member type '(:document :subdocument))
-                      (cosmetic-css adblocker url)
+                      (cosmetic-payload adblocker url)
                       "")
                   (encode-replacements
                    (response-replacements adblocker url
