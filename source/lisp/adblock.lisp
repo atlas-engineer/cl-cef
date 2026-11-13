@@ -1584,15 +1584,40 @@ that rewrite a request instead of blocking it are not applied as blocks.")
                                      :if-does-not-exist :create
                                      :external-format :utf-8))
 
+(defun system-ca-file ()
+  "A PEM CA bundle, or NIL. `SSL_CERT_FILE' is used when it names a file.
+OpenSSL's compiled-in directory is `/usr/lib/ssl/certs' on the library shipped
+with the Linux binary. That directory is absent on other distributions, and a
+download then fails with `X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY'."
+  (let ((from-env (uiop:getenv "SSL_CERT_FILE")))
+    (when (and from-env (uiop:file-exists-p from-env))
+      (return-from system-ca-file from-env)))
+  (some (lambda (path)
+          (when (uiop:file-exists-p path)
+            path))
+        '("/etc/ssl/certs/ca-certificates.crt"
+          "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+          "/etc/pki/tls/certs/ca-bundle.crt"
+          "/etc/ssl/ca-bundle.pem"
+          "/etc/ssl/cert.pem")))
+
 (defun fetch-text (url)
-  (if (find-package :dexador)
-      (uiop:symbol-call :dexador :get url
-                        :force-string t
-                        :connect-timeout 10
-                        :read-timeout 30)
-      (uiop:run-program (list "curl" "-fsSL" "--max-time" "30" url)
-                        :output :string
-                        :external-format :utf-8)))
+  (let ((ca-file (system-ca-file)))
+    (if (find-package :dexador)
+        (apply #'uiop:symbol-call
+               :dexador :get url
+               :force-string t
+               :connect-timeout 10
+               :read-timeout 30
+               (when ca-file
+                 (list :ca-path ca-file)))
+        (uiop:run-program
+         (append (list "curl" "-fsSL" "--max-time" "30")
+                 (when ca-file
+                   (list "--cacert" ca-file))
+                 (list url))
+         :output :string
+         :external-format :utf-8))))
 
 (defun ensure-list-text (name url)
   (let ((path (filter-cache-path name)))
