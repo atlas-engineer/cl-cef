@@ -101,6 +101,19 @@ COLOR is an opaque ARGB integer. 0 uses the process default."
     (forget-object (web-contents view))
     (setf (web-contents view) nil)))
 
+(defun content-side-code (side)
+  (ecase side
+    (:page 0)
+    (:left 1)
+    (:right 2)))
+
+(export-always 'set-side-width)
+(defmethod set-side-width ((view view) width &key (side :left))
+  "Keep VIEW at WIDTH pixels on SIDE of the page.
+SIDE is `:left' or `:right'. WIDTH 0 hides VIEW. The page keeps the rest."
+  (cl-cef-view-set-side-width (id view) (or width 0) (content-side-code side))
+  width)
+
 (export-always 'set-bar-height)
 (defmethod set-bar-height ((view view) height)
   "Keep VIEW at HEIGHT pixels. The page view stays flexible; bars do not.

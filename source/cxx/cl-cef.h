@@ -149,6 +149,9 @@ void cl_cef_window_set_bounds(int id, int x, int y, int width, int height);
 void cl_cef_window_add_view(int window_id, int view_id);
 void cl_cef_window_add_view_at(int window_id, int view_id, int index);
 void cl_cef_window_remove_view(int window_id, int view_id);
+/* SIDE is 0 for the page, 1 for the left of it, 2 for the right.
+ * The page keeps the width the side strips do not use. */
+void cl_cef_window_add_content_view(int window_id, int view_id, int side);
 
 void cl_cef_set_background_color(unsigned int color);
 
@@ -157,6 +160,8 @@ void cl_cef_view_destroy(int id);
 void cl_cef_view_set_background_color(int id, unsigned int color);
 unsigned int cl_cef_view_background_color(int id);
 void cl_cef_view_set_bar_height(int id, int height);
+/* SIDE is 1 for the left of the page and 2 for the right. WIDTH 0 hides it. */
+void cl_cef_view_set_side_width(int id, int width, int side);
 void cl_cef_view_set_bounds(int id, int x, int y, int width, int height);
 void cl_cef_view_get_bounds(int id, int* x, int* y, int* width, int* height);
 void cl_cef_view_focus(int id);

@@ -191,6 +191,11 @@
   (window-id :int)
   (view-id :int))
 
+(defcef "cl_cef_window_add_content_view" :void
+  (window-id :int)
+  (view-id :int)
+  (side :int))
+
 (defcef "cl_cef_set_background_color" :void
   (color :unsigned-int))
 
@@ -213,6 +218,11 @@
 (defcef "cl_cef_view_set_bar_height" :void
   (id :int)
   (height :int))
+
+(defcef "cl_cef_view_set_side_width" :void
+  (id :int)
+  (width :int)
+  (side :int))
 
 (defcef "cl_cef_view_set_bounds" :void
   (id :int)

@@ -20,6 +20,7 @@
 #include "include/base/cef_build.h"
 #include "include/views/cef_box_layout.h"
 #include "include/views/cef_browser_view.h"
+#include "include/views/cef_panel.h"
 #include "include/views/cef_browser_view_delegate.h"
 #include "include/views/cef_window.h"
 #include "include/views/cef_window_delegate.h"
@@ -306,6 +307,8 @@ struct ViewRecord {
   cef_color_t background_color = 0;
   int bar_height = 0;
   bool flex_set = false;
+  int content_slot = 0;
+  int side_width = 0;
   // Set while this view is being destroyed. DoClose uses it to close the
   // browser without also closing the window that hosts the other views.
   bool destroying = false;
@@ -325,6 +328,8 @@ struct WindowRecord {
   CefRefPtr<CefWindow> window;
   CefRefPtr<CefWindowDelegate> delegate;
   CefRefPtr<CefBoxLayout> layout;
+  CefRefPtr<CefPanel> content;
+  CefRefPtr<CefBoxLayout> content_layout;
   int width = 1600;
   int height = 1200;
   std::string title;
@@ -2516,7 +2521,13 @@ class BrowserViewDelegate : public CefBrowserViewDelegate {
   CefSize GetMaximumSize(CefRefPtr<CefView> view) override {
     (void)view;
     auto record = FindView(view_id_);
-    if (!record || !record->bar)
+    if (!record)
+      return CefSize();
+    if (record->content_slot == 1 || record->content_slot == 2) {
+      int width = record->side_width > 0 ? record->side_width : 0;
+      return CefSize(width, 100000);
+    }
+    if (!record->bar)
       return CefSize();
     // Width may grow with the window. Height stays the bar height, so vh
     // units in the status document resolve against that strip.
@@ -2549,7 +2560,13 @@ class BrowserViewDelegate : public CefBrowserViewDelegate {
   CefSize BarSize(CefRefPtr<CefView> view) const {
     (void)view;
     auto record = FindView(view_id_);
-    if (!record || !record->bar)
+    if (!record)
+      return CefSize();
+    if (record->content_slot == 1 || record->content_slot == 2) {
+      int width = record->side_width > 0 ? record->side_width : 0;
+      return CefSize(width, 1);
+    }
+    if (!record->bar)
       return CefSize();
     return CefSize(1, record->bar_height);
   }
@@ -3226,6 +3243,151 @@ void cl_cef_window_set_bounds(int id, int x, int y, int width, int height) {
   });
 }
 
+std::shared_ptr<WindowRecord> FindWindowByWidget(CefRefPtr<CefWindow> window) {
+  if (!window)
+    return nullptr;
+  std::lock_guard<std::mutex> lock(g_mu);
+  for (const auto& entry : g_windows) {
+    if (entry.second && entry.second->window && entry.second->window->IsSame(window))
+      return entry.second;
+  }
+  return nullptr;
+}
+
+int ContentSlotOf(CefRefPtr<CefView> widget) {
+  if (!widget)
+    return 0;
+  std::lock_guard<std::mutex> lock(g_mu);
+  for (const auto& entry : g_views) {
+    const auto& record = entry.second;
+    if (record && record->widget && record->widget->IsSame(widget))
+      return record->content_slot;
+  }
+  return 0;
+}
+
+void EnsureContentRow(const std::shared_ptr<WindowRecord>& window) {
+  if (!window || !window->window || window->content)
+    return;
+  window->content = CefPanel::CreatePanel(nullptr);
+  CefBoxLayoutSettings settings;
+  settings.horizontal = 1;
+  settings.between_child_spacing = 0;
+  settings.default_flex = 0;
+  settings.cross_axis_alignment = CEF_AXIS_ALIGNMENT_STRETCH;
+  window->content_layout = window->content->SetToBoxLayout(settings);
+  window->window->AddChildViewAt(window->content, 0);
+  if (window->layout)
+    window->layout->SetFlexForView(window->content, 1);
+}
+
+int CountContentSlot(const std::shared_ptr<WindowRecord>& window, int slot,
+                    CefRefPtr<CefView> except) {
+  int count = static_cast<int>(window->content->GetChildViewCount());
+  int total = 0;
+  for (int i = 0; i < count; ++i) {
+    CefRefPtr<CefView> child = window->content->GetChildViewAt(i);
+    if (except && child->IsSame(except))
+      continue;
+    if (ContentSlotOf(child) == slot)
+      ++total;
+  }
+  return total;
+}
+
+int ContentChildIndex(const std::shared_ptr<WindowRecord>& window, CefRefPtr<CefView> widget) {
+  int count = static_cast<int>(window->content->GetChildViewCount());
+  for (int i = 0; i < count; ++i) {
+    if (window->content->GetChildViewAt(i)->IsSame(widget))
+      return i;
+  }
+  return -1;
+}
+
+bool OnRequestedSide(const std::shared_ptr<WindowRecord>& window,
+                     const std::shared_ptr<ViewRecord>& view) {
+  int index = ContentChildIndex(window, view->widget);
+  if (index < 0)
+    return false;
+  int count = static_cast<int>(window->content->GetChildViewCount());
+  if (view->content_slot == 1) {
+    for (int i = 0; i < index; ++i) {
+      if (ContentSlotOf(window->content->GetChildViewAt(i)) != 1)
+        return false;
+    }
+    return true;
+  }
+  if (view->content_slot == 2) {
+    for (int i = index + 1; i < count; ++i) {
+      if (ContentSlotOf(window->content->GetChildViewAt(i)) != 2)
+        return false;
+    }
+    return true;
+  }
+  for (int i = 0; i < index; ++i) {
+    if (ContentSlotOf(window->content->GetChildViewAt(i)) != 1)
+      return false;
+  }
+  for (int i = index + 1; i < count; ++i) {
+    if (ContentSlotOf(window->content->GetChildViewAt(i)) != 2)
+      return false;
+  }
+  return true;
+}
+
+int ContentIndex(const std::shared_ptr<WindowRecord>& window,
+                 const std::shared_ptr<ViewRecord>& view,
+                 bool in_content) {
+  if (view->content_slot == 2) {
+    int count = static_cast<int>(window->content->GetChildViewCount());
+    return in_content ? std::max(0, count - 1) : count;
+  }
+  return CountContentSlot(window, 1, view->widget);
+}
+
+void PlaceContentView(const std::shared_ptr<WindowRecord>& window,
+                      const std::shared_ptr<ViewRecord>& view) {
+  if (!window || !window->window || !view || !view->widget)
+    return;
+  EnsureContentRow(window);
+  if (!window->content)
+    return;
+  bool side = view->content_slot == 1 || view->content_slot == 2;
+  if (side && view->side_width <= 0) {
+    if (CefRefPtr<CefView> parent = view->widget->GetParentView()) {
+      if (auto panel = parent->AsPanel())
+        panel->RemoveChildView(view->widget);
+    }
+    view->widget->SetVisible(false);
+    window->content->InvalidateLayout();
+    window->content->Layout();
+    window->window->Layout();
+    return;
+  }
+  view->widget->SetVisible(true);
+  CefRefPtr<CefView> parent = view->widget->GetParentView();
+  bool in_content = parent && window->content->IsSame(parent);
+  if (parent && !in_content) {
+    if (auto panel = parent->AsPanel())
+      panel->RemoveChildView(view->widget);
+    in_content = false;
+  }
+  if (!(in_content && OnRequestedSide(window, view))) {
+    int index = ContentIndex(window, view, in_content);
+    if (in_content)
+      window->content->ReorderChildView(view->widget, index);
+    else
+      window->content->AddChildViewAt(view->widget, index);
+  }
+  if (window->content_layout)
+    window->content_layout->SetFlexForView(view->widget, side ? 0 : 1);
+  view->widget->SetFocusable(true);
+  view->widget->InvalidateLayout();
+  window->content->Layout();
+  window->window->Layout();
+  ApplyHostIdentity(window->window);
+}
+
 void PlaceView(const std::shared_ptr<WindowRecord>& window,
                const std::shared_ptr<ViewRecord>& view,
                int index) {
@@ -3272,11 +3434,39 @@ void cl_cef_window_add_view_at(int window_id, int view_id, int index) {
 }
 
 void cl_cef_window_remove_view(int window_id, int view_id) {
+  (void)window_id;
+  auto view = FindView(view_id);
+  CallUI([view]() {
+    if (!view || !view->widget)
+      return;
+    if (CefRefPtr<CefView> parent = view->widget->GetParentView()) {
+      if (auto panel = parent->AsPanel())
+        panel->RemoveChildView(view->widget);
+    }
+  });
+}
+
+void cl_cef_window_add_content_view(int window_id, int view_id, int side) {
   auto window = FindWindow(window_id);
   auto view = FindView(view_id);
-  CallUI([&]() {
-    if (window && window->window && view && view->widget)
-      window->window->RemoveChildView(view->widget);
+  if (view)
+    view->content_slot = side;
+  CallUI([window, view]() { PlaceContentView(window, view); });
+}
+
+void cl_cef_view_set_side_width(int id, int width, int side) {
+  auto record = FindView(id);
+  if (!record)
+    return;
+  record->content_slot = side;
+  record->side_width = width > 0 ? width : 0;
+  record->width = record->side_width;
+  CallUI([record]() {
+    if (!record->widget)
+      return;
+    auto window = FindWindowByWidget(record->widget->GetWindow());
+    if (window)
+      PlaceContentView(window, record);
   });
 }
 

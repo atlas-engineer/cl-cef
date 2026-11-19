@@ -138,6 +138,14 @@ Re-adding a view moves it to the top."
   (cl-cef-window-add-view (id window) (id view))
   (remember-view window view))
 
+(export-always 'add-content-view)
+(defmethod add-content-view ((window window) (view view) &key (side :page))
+  "Place VIEW in WINDOW's content row, beside or as the page.
+SIDE `:page' is the flexible center. `:left' and `:right' are strips as tall
+as that page. A side view's width comes from `set-side-width'."
+  (cl-cef-window-add-content-view (id window) (id view) (content-side-code side))
+  (remember-view window view))
+
 (export-always 'add-view-at)
 (defmethod add-view-at ((window window) (view view) index)
   "Insert VIEW at INDEX in WINDOW's vertical stack. 0 is the top."
