@@ -3634,7 +3634,11 @@ void cl_cef_view_set_corner_radius(int id, int radius) {
   CallUI([record, corner]() {
     if (!record->widget || record->bar || record->content_slot != 0)
       return;
+#ifdef CL_CEF_HAS_CORNER_RADIUS
     record->widget->SetCornerRadius(corner);
+#else
+    (void)corner;
+#endif
   });
 }
 
