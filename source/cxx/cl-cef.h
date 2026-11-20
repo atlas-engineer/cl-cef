@@ -160,6 +160,8 @@ void cl_cef_view_destroy(int id);
 void cl_cef_view_set_background_color(int id, unsigned int color);
 unsigned int cl_cef_view_background_color(int id);
 void cl_cef_view_set_bar_height(int id, int height);
+void cl_cef_view_set_insets(int id, int top, int left, int bottom, int right);
+void cl_cef_view_set_corner_radius(int id, int radius);
 /* SIDE is 1 for the left of the page and 2 for the right. WIDTH 0 hides it. */
 void cl_cef_view_set_side_width(int id, int width, int side);
 void cl_cef_view_set_bounds(int id, int x, int y, int width, int height);

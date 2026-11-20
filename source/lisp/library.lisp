@@ -219,6 +219,17 @@
   (id :int)
   (height :int))
 
+(defcef "cl_cef_view_set_insets" :void
+  (id :int)
+  (top :int)
+  (left :int)
+  (bottom :int)
+  (right :int))
+
+(defcef "cl_cef_view_set_corner_radius" :void
+  (id :int)
+  (radius :int))
+
 (defcef "cl_cef_view_set_side_width" :void
   (id :int)
   (width :int)
