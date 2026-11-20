@@ -309,6 +309,12 @@ struct ViewRecord {
   bool flex_set = false;
   int content_slot = 0;
   int side_width = 0;
+  bool insets_applied = false;
+  int inset_top = 0;
+  int inset_left = 0;
+  int inset_bottom = 0;
+  int inset_right = 0;
+  int corner_radius = 0;
   // Set while this view is being destroyed. DoClose uses it to close the
   // browser without also closing the window that hosts the other views.
   bool destroying = false;
@@ -1942,6 +1948,10 @@ class Client : public CefClient,
     // 100% in a context that has no stored about:blank zoom.
     if (view->isolated)
       browser->GetHost()->SetZoomLevel(0.0);
+#ifdef CL_CEF_HAS_CORNER_RADIUS
+    if (view->widget && view->corner_radius > 0)
+      view->widget->SetCornerRadius(view->corner_radius);
+#endif
     // Delete can win the race against creation. Close now that a browser
     // exists; DropView runs from OnBrowserDestroyed.
     if (view->destroying) {
@@ -3385,6 +3395,10 @@ void PlaceContentView(const std::shared_ptr<WindowRecord>& window,
   view->widget->InvalidateLayout();
   window->content->Layout();
   window->window->Layout();
+#ifdef CL_CEF_HAS_CORNER_RADIUS
+  if (view->corner_radius > 0)
+    view->widget->SetCornerRadius(view->corner_radius);
+#endif
   ApplyHostIdentity(window->window);
 }
 
@@ -3417,6 +3431,10 @@ void PlaceView(const std::shared_ptr<WindowRecord>& window,
   }
   view->widget->SetFocusable(true);
   window->window->Layout();
+#ifdef CL_CEF_HAS_CORNER_RADIUS
+  if (view->corner_radius > 0)
+    view->widget->SetCornerRadius(view->corner_radius);
+#endif
   // Adding a browser view is when Chrome paints the product logo again.
   ApplyHostIdentity(window->window);
 }
@@ -3613,26 +3631,54 @@ unsigned int cl_cef_view_background_color(int id) {
 
 void cl_cef_view_set_insets(int id, int top, int left, int bottom, int right) {
   auto record = FindView(id);
-  if (!record || record->bar || record->content_slot != 0)
+  if (!record)
     return;
-  CallUI([record, top, left, bottom, right]() {
-    if (!record->widget || record->bar || record->content_slot != 0)
+  int clamped_top = top > 0 ? top : 0;
+  int clamped_left = left > 0 ? left : 0;
+  int clamped_bottom = bottom > 0 ? bottom : 0;
+  int clamped_right = right > 0 ? right : 0;
+  CallUI([record, clamped_top, clamped_left, clamped_bottom, clamped_right]() {
+    if (!record->widget)
       return;
-    record->widget->SetInsets(CefInsets(top > 0 ? top : 0, left > 0 ? left : 0,
-                                        bottom > 0 ? bottom : 0, right > 0 ? right : 0));
+    if (record->insets_applied &&
+        record->inset_top == clamped_top &&
+        record->inset_left == clamped_left &&
+        record->inset_bottom == clamped_bottom &&
+        record->inset_right == clamped_right)
+      return;
+    record->inset_top = clamped_top;
+    record->inset_left = clamped_left;
+    record->inset_bottom = clamped_bottom;
+    record->inset_right = clamped_right;
+    record->insets_applied = true;
+    CefRect before = record->widget->GetBounds();
+    record->widget->SetInsets(
+        CefInsets(clamped_top, clamped_left, clamped_bottom, clamped_right));
     record->widget->InvalidateLayout();
     if (auto window = record->widget->GetWindow())
       window->Layout();
+    CefRect after = record->widget->GetBounds();
+    if (after.width > 0 && after.height > 0 &&
+        after.x == before.x && after.y == before.y &&
+        after.width == before.width && after.height == before.height) {
+      record->widget->SetSize(CefSize(after.width, after.height + 1));
+      record->widget->SetBounds(after);
+    }
+#ifdef CL_CEF_HAS_CORNER_RADIUS
+    if (record->corner_radius > 0)
+      record->widget->SetCornerRadius(record->corner_radius);
+#endif
   });
 }
 
 void cl_cef_view_set_corner_radius(int id, int radius) {
   auto record = FindView(id);
-  if (!record || record->bar || record->content_slot != 0)
+  if (!record)
     return;
   int corner = radius > 0 ? radius : 0;
   CallUI([record, corner]() {
-    if (!record->widget || record->bar || record->content_slot != 0)
+    record->corner_radius = corner;
+    if (!record->widget)
       return;
 #ifdef CL_CEF_HAS_CORNER_RADIUS
     record->widget->SetCornerRadius(corner);
