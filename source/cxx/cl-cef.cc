@@ -3613,10 +3613,10 @@ unsigned int cl_cef_view_background_color(int id) {
 
 void cl_cef_view_set_insets(int id, int top, int left, int bottom, int right) {
   auto record = FindView(id);
-  if (!record)
+  if (!record || record->bar || record->content_slot != 0)
     return;
   CallUI([record, top, left, bottom, right]() {
-    if (!record->widget)
+    if (!record->widget || record->bar || record->content_slot != 0)
       return;
     record->widget->SetInsets(CefInsets(top > 0 ? top : 0, left > 0 ? left : 0,
                                         bottom > 0 ? bottom : 0, right > 0 ? right : 0));
@@ -3628,11 +3628,11 @@ void cl_cef_view_set_insets(int id, int top, int left, int bottom, int right) {
 
 void cl_cef_view_set_corner_radius(int id, int radius) {
   auto record = FindView(id);
-  if (!record)
+  if (!record || record->bar || record->content_slot != 0)
     return;
   int corner = radius > 0 ? radius : 0;
   CallUI([record, corner]() {
-    if (!record->widget)
+    if (!record->widget || record->bar || record->content_slot != 0)
       return;
     record->widget->SetCornerRadius(corner);
   });
