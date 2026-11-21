@@ -7,6 +7,9 @@
 
 (in-package :cef)
 
+(defvar *registry-lock* (bt:make-recursive-lock "cl-cef-registry")
+  "Lock serializing access to `*objects*' and `*listeners*'.")
+
 (defvar *objects* (make-hash-table)
   "Map from bridge object id to the Lisp object that owns it.")
 
@@ -148,23 +151,26 @@ The sandbox needs extra setup (chrome-sandbox) that this bridge does not perform
     (setf (slot-value object 'interface) interface)))
 
 (defun register-object (object)
-  (setf (gethash (id object) *objects*) object))
+  (bt:with-recursive-lock-held (*registry-lock*)
+    (setf (gethash (id object) *objects*) object)))
 
 (defun forget-object (object)
-  (remhash (id object) *objects*)
-  (let ((stale '()))
-    (maphash (lambda (key value)
-               (declare (ignore value))
-               (when (eql (car key) (id object))
-                 (push key stale)))
-             *listeners*)
-    (dolist (key stale)
-      (remhash key *listeners*))))
+  (bt:with-recursive-lock-held (*registry-lock*)
+    (remhash (id object) *objects*)
+    (let ((stale '()))
+      (maphash (lambda (key value)
+                 (declare (ignore value))
+                 (when (eql (car key) (id object))
+                   (push key stale)))
+               *listeners*)
+      (dolist (key stale)
+        (remhash key *listeners*)))))
 
 (defun find-object (id)
   (if (= id +session-object-id+)
       (and *interface* (session *interface*))
-      (gethash id *objects*)))
+      (bt:with-recursive-lock-held (*registry-lock*)
+        (gethash id *objects*))))
 
 (export-always 'on-ui-thread-p)
 (defun on-ui-thread-p ()
@@ -270,7 +276,8 @@ write barrier, so that handler has to stay disabled."
          (event (when (stringp event-name)
                   (intern (string-upcase event-name) :keyword)))
          (key (cons object-id event))
-         (entries (copy-list (gethash key *listeners*)))
+         (entries (bt:with-recursive-lock-held (*registry-lock*)
+                    (copy-list (gethash key *listeners*))))
          (consumed nil))
     (dolist (entry entries)
       (destructuring-bind (callback object once-p) entry
@@ -278,8 +285,9 @@ write barrier, so that handler has to stay disabled."
           (when result
             (setf consumed t))
           (when once-p
-            (setf (gethash key *listeners*)
-                  (remove entry (gethash key *listeners*) :test #'eq))))))
+            (bt:with-recursive-lock-held (*registry-lock*)
+              (setf (gethash key *listeners*)
+                    (remove entry (gethash key *listeners*) :test #'eq)))))))
     (if consumed 1 0)))
 
 (defvar *scheme-callbacks* (make-hash-table :test 'equal)
@@ -322,9 +330,10 @@ write barrier, so that handler has to stay disabled."
 (defgeneric add-listener (object event callback &key once-p)
   (:method ((object remote-object) (event symbol) (callback function) &key once-p)
     (let ((key (cons (id object) event)))
-      (setf (gethash key *listeners*)
-            (append (gethash key *listeners*)
-                    (list (list callback object once-p)))))
+      (bt:with-recursive-lock-held (*registry-lock*)
+        (setf (gethash key *listeners*)
+              (append (gethash key *listeners*)
+                      (list (list callback object once-p))))))
     callback)
   (:documentation "Register CALLBACK to run for EVENT on OBJECT.
 

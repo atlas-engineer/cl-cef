@@ -166,6 +166,11 @@ class DevToolsObserver : public CefDevToolsMessageObserver {
     waiters_[id] = std::move(waiter);
   }
 
+  void Cancel(int id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    waiters_.erase(id);
+  }
+
   void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,
                               int message_id,
                               bool success,
@@ -522,6 +527,30 @@ bool BrowserBelongsToView(const std::shared_ptr<ViewRecord>& view,
 // Release the native view. The CefBrowserView has to outlive its browser:
 // dropping it while the browser is still closing runs ~CefViewView, which
 // CHECKs on the UI thread. Call this from OnBrowserDestroyed, after close.
+void RemoveIsolatedViewCaches(const std::string& root_cache_path) {
+  if (root_cache_path.empty())
+    return;
+  std::error_code error;
+  for (const auto& entry : std::filesystem::directory_iterator(root_cache_path, error)) {
+    if (!entry.is_directory(error))
+      continue;
+    std::string name = entry.path().filename().string();
+    if (name.size() <= 5 || name.compare(0, 5, "view-") != 0)
+      continue;
+    bool all_digits = true;
+    for (size_t i = 5; i < name.size(); ++i) {
+      if (name[i] < '0' || name[i] > '9') {
+        all_digits = false;
+        break;
+      }
+    }
+    if (all_digits) {
+      std::error_code remove_error;
+      std::filesystem::remove_all(entry.path(), remove_error);
+    }
+  }
+}
+
 void DropView(const std::shared_ptr<ViewRecord>& record) {
   if (!record)
     return;
@@ -1839,6 +1868,7 @@ void CloseTrackedBrowsers() {
                 if (g_loop_done.load())
                   return;
                 g_menu = nullptr;
+                g_download_callbacks.clear();
                 ReleaseAppIcon();
                 {
                   std::lock_guard<std::mutex> lock(g_browser_mu);
@@ -2415,7 +2445,9 @@ class Client : public CefClient,
     if (!download_item)
       return;
     uint32_t id = download_item->GetId();
-    if (callback)
+    if (!download_item->IsInProgress())
+      g_download_callbacks.erase(id);
+    else if (callback)
       g_download_callbacks[id] = callback;
     const char* state = "interrupted";
     if (download_item->IsComplete())
@@ -3086,6 +3118,7 @@ int cl_cef_initialize(int argc,
     CefString(&settings.browser_subprocess_path) = subprocess_path;
   if (cache_path && *cache_path) {
     g_root_cache_path = cache_path;
+    RemoveIsolatedViewCaches(g_root_cache_path);
     CefString(&settings.root_cache_path) = cache_path;
     CefString(&settings.cache_path) = std::string(cache_path) + "/cache";
   }
@@ -3140,6 +3173,7 @@ void cl_cef_shutdown(void) {
     // Browsers are already closed. Dropping the view widgets here deadlocks:
     // their destructors wait on the message loop, which has returned.
     CefShutdown();
+    RemoveIsolatedViewCaches(g_root_cache_path);
   }
   // The helpers outlive CefShutdown when the Lisp process keeps running.
   ReapHelpers();
@@ -3622,7 +3656,13 @@ void LayoutWindowViews(const std::shared_ptr<WindowRecord>& window) {
   } else if (window->matte) {
     window->matte->SetViewportCutout(false, 0, 0, 0, 0, 0, 0, 0, 0);
     window->matte->SetVisible(false);
-    RemoveWindowChild(window->matte);
+    CefRefPtr<CefView> parent = window->matte->GetParentView();
+    if (parent && parent->IsSame(window->window)) {
+      auto insert_pos = (!z_order.empty() && window->page_view_id > 0)
+                            ? (z_order.begin() + 1)
+                            : z_order.begin();
+      z_order.insert(insert_pos, window->matte);
+    }
   }
 #endif
 
@@ -4385,10 +4425,13 @@ char* cl_cef_view_execute_javascript_sync(int id, const char* code, int* success
   });
   if (message_id <= 0)
     return nullptr;
+  bool completed = false;
   {
     std::unique_lock<std::mutex> lock(waiter->mu);
-    waiter->cv.wait_for(lock, std::chrono::seconds(30), [&]() { return waiter->done; });
+    completed = waiter->cv.wait_for(lock, std::chrono::seconds(30), [&]() { return waiter->done; });
   }
+  if (!completed && record->devtools_observer)
+    record->devtools_observer->Cancel(message_id);
   if (success)
     *success = waiter->success ? 1 : 0;
   return waiter->success ? Dup(waiter->json) : nullptr;
