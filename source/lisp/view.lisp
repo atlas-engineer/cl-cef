@@ -129,6 +129,18 @@ RADIUS 0 restores square corners."
   (cl-cef-view-set-corner-radius (id view) (or radius 0))
   radius)
 
+(export-always 'set-background-blur)
+(defmethod set-background-blur ((view view) radius)
+  "Blur the compositor surface behind VIEW by RADIUS pixels."
+  (cl-cef-view-set-background-blur (id view) (or radius 0))
+  radius)
+
+(export-always 'set-safe-area-insets)
+(defmethod set-safe-area-insets ((view view) &key (top 0) (left 0) (bottom 0) (right 0))
+  "Push VIEW's viewport layout inward by TOP, LEFT, BOTTOM, and RIGHT pixels."
+  (cl-cef-view-set-safe-area-insets (id view) (or top 0) (or left 0) (or bottom 0) (or right 0))
+  (values top left bottom right))
+
 (export-always 'set-bar-height)
 (defmethod set-bar-height ((view view) height)
   "Keep VIEW at HEIGHT pixels. The page view stays flexible; bars do not.

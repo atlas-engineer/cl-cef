@@ -304,7 +304,9 @@ struct ViewRecord {
   // name for the page profile's theme service, and the window observer is
   // added to that service again.
   bool isolated = false;
+  bool transparent_background = false;
   cef_color_t background_color = 0;
+  int window_id = 0;
   int bar_height = 0;
   bool flex_set = false;
   int content_slot = 0;
@@ -315,6 +317,12 @@ struct ViewRecord {
   int inset_bottom = 0;
   int inset_right = 0;
   int corner_radius = 0;
+  int background_blur = 0;
+  bool safe_area_applied = false;
+  int safe_top = 0;
+  int safe_left = 0;
+  int safe_bottom = 0;
+  int safe_right = 0;
   // Set while this view is being destroyed. DoClose uses it to close the
   // browser without also closing the window that hosts the other views.
   bool destroying = false;
@@ -336,6 +344,21 @@ struct WindowRecord {
   CefRefPtr<CefBoxLayout> layout;
   CefRefPtr<CefPanel> content;
   CefRefPtr<CefBoxLayout> content_layout;
+  int page_view_id = 0;
+  std::vector<int> left_view_ids;
+  std::vector<int> right_view_ids;
+  std::vector<int> bar_view_ids;
+  CefRefPtr<CefPanel> matte;
+  bool frame_enabled = false;
+  int frame_top = 12;
+  int frame_left = 12;
+  int frame_bottom = 0;
+  int frame_right = 12;
+  int frame_radius = 6;
+  int frame_blur = 24;
+  cef_color_t frame_tint_color = 0;
+  cef_color_t frame_border_color = 0;
+  bool laying_out = false;
   int width = 1600;
   int height = 1200;
   std::string title;
@@ -2479,17 +2502,45 @@ cef_color_t ResolveBackground(unsigned int color) {
   return normalized ? normalized : g_background_color.load();
 }
 
-void ConfigureBrowserBackground(CefBrowserSettings& settings, cef_color_t color) {
+void ConfigureBrowserBackground(CefBrowserSettings& settings,
+                                cef_color_t color,
+                                bool transparent) {
   settings.javascript = STATE_ENABLED;
   settings.image_loading = STATE_ENABLED;
-  if (CefColorGetA(color) == 0xFF)
+  if (!transparent && CefColorGetA(color) == 0xFF)
     settings.background_color = color;
 }
 
-void PaintViewBackground(CefRefPtr<CefView> view, cef_color_t color) {
-  if (view && CefColorGetA(color) == 0xFF)
+void PaintViewBackground(CefRefPtr<CefView> view,
+                         cef_color_t color,
+                         bool transparent) {
+  if (!view)
+    return;
+  if (transparent)
+    view->SetBackgroundColor(0);
+  else if (CefColorGetA(color) == 0xFF)
     view->SetBackgroundColor(color);
 }
+
+void ApplyViewDecorations(const std::shared_ptr<ViewRecord>& record) {
+  if (!record || !record->widget)
+    return;
+#ifdef CL_CEF_HAS_CORNER_RADIUS
+  record->widget->SetCornerRadius(record->corner_radius);
+#endif
+#ifdef CL_CEF_HAS_BACKGROUND_BLUR
+  record->widget->SetBackgroundBlur(record->background_blur);
+#endif
+#ifdef CL_CEF_HAS_SAFE_AREA_INSETS
+  if (record->safe_area_applied) {
+    record->widget->SetSafeAreaInsets(
+        record->safe_top, record->safe_left,
+        record->safe_bottom, record->safe_right);
+  }
+#endif
+}
+
+void LayoutWindowViews(const std::shared_ptr<WindowRecord>& window);
 
 void PaintWindowBackground(CefRefPtr<CefWindow> window) {
   cef_color_t color = g_background_color.load();
@@ -2505,7 +2556,7 @@ class BrowserViewDelegate : public CefBrowserViewDelegate {
   void OnThemeChanged(CefRefPtr<CefView> view) override {
     auto record = FindView(view_id_);
     if (record)
-      PaintViewBackground(view, record->background_color);
+      PaintViewBackground(view, record->background_color, record->transparent_background);
   }
 
   // A Chrome window hosts one Chrome browser view. Further views (status,
@@ -2632,13 +2683,26 @@ class WindowDelegate : public CefWindowDelegate {
     Emit(id_, "{\"event\":\"close\"}");
   }
 
+  void OnLayoutChanged(CefRefPtr<CefView> view, const CefRect& new_bounds) override {
+    (void)view;
+    if (auto record = FindWindow(id_)) {
+      if (new_bounds.width > 0 && new_bounds.height > 0) {
+        record->width = new_bounds.width;
+        record->height = new_bounds.height;
+        LayoutWindowViews(record);
+      }
+    }
+  }
+
   void OnWindowBoundsChanged(CefRefPtr<CefWindow> window, const CefRect& new_bounds) override {
     (void)window;
     // SetBounds from a resize listener calls back into this method. A nested
     // emit runs that listener again and overflows the UI thread.
     if (auto record = FindWindow(id_)) {
-      record->width = new_bounds.width;
-      record->height = new_bounds.height;
+      CefRect client = record->window ? record->window->GetBounds() : CefRect();
+      record->width = client.width > 0 ? client.width : new_bounds.width;
+      record->height = client.height > 0 ? client.height : new_bounds.height;
+      LayoutWindowViews(record);
     }
     if (emitting_bounds_)
       return;
@@ -3133,6 +3197,9 @@ int cl_cef_window_create(int width, int height, const char* title) {
     record->delegate = new WindowDelegate(id, record->width, record->height);
     record->window = CefWindow::CreateTopLevelWindow(record->delegate);
     if (record->window) {
+#ifdef CL_CEF_HAS_CLEAR_LAYOUT
+      record->window->ClearLayout();
+#else
       // Vertical stack: the flexible page, then the fixed bars. Without this,
       // a browser view's preferred size is the whole window and Chrome parks
       // it at the top.
@@ -3142,6 +3209,7 @@ int cl_cef_window_create(int width, int height, const char* title) {
       settings.default_flex = 0;
       settings.cross_axis_alignment = CEF_AXIS_ALIGNMENT_STRETCH;
       record->layout = record->window->SetToBoxLayout(settings);
+#endif
       record->window->SetTitle(record->title);
       record->window->Show();
       ApplyHostIdentity(record->window);
@@ -3160,6 +3228,13 @@ void cl_cef_window_close(int id) {
   if (record)
     record->allow_close = true;
   CallUI([&]() {
+    if (record && record->matte) {
+      if (CefRefPtr<CefView> parent = record->matte->GetParentView()) {
+        if (auto panel = parent->AsPanel())
+          panel->RemoveChildView(record->matte);
+      }
+      record->matte = nullptr;
+    }
     if (record && record->window) {
       UnmapNativeWindow(record->window);
       record->window->Close();
@@ -3355,10 +3430,255 @@ int ContentIndex(const std::shared_ptr<WindowRecord>& window,
   return CountContentSlot(window, 1, view->widget);
 }
 
+void EraseId(std::vector<int>& ids, int id) {
+  ids.erase(std::remove(ids.begin(), ids.end(), id), ids.end());
+}
+
+void DetachFromWindowSlots(const std::shared_ptr<WindowRecord>& window, int view_id) {
+  if (!window)
+    return;
+  if (window->page_view_id == view_id)
+    window->page_view_id = 0;
+  EraseId(window->left_view_ids, view_id);
+  EraseId(window->right_view_ids, view_id);
+  EraseId(window->bar_view_ids, view_id);
+}
+
+void EnsureWindowChild(CefRefPtr<CefWindow> win, CefRefPtr<CefView> child) {
+  if (!win || !child)
+    return;
+  CefRefPtr<CefView> parent = child->GetParentView();
+  if (parent && parent->IsSame(win))
+    return;
+  if (parent) {
+    if (auto panel = parent->AsPanel())
+      panel->RemoveChildView(child);
+  }
+  win->AddChildView(child);
+}
+
+void RemoveWindowChild(CefRefPtr<CefView> child) {
+  if (!child)
+    return;
+  if (CefRefPtr<CefView> parent = child->GetParentView()) {
+    if (auto panel = parent->AsPanel())
+      panel->RemoveChildView(child);
+  }
+}
+
+extern "C++" {
+namespace {
+
+void LayoutWindowViews(const std::shared_ptr<WindowRecord>& window) {
+#ifdef CL_CEF_HAS_CLEAR_LAYOUT
+  if (!window || !window->window || window->laying_out)
+    return;
+  window->laying_out = true;
+  CefRect client = window->window->GetBounds();
+  int win_w = client.width > 0 ? client.width : window->width;
+  int win_h = client.height > 0 ? client.height : window->height;
+  win_w = std::max(1, win_w);
+  win_h = std::max(1, win_h);
+  window->width = win_w;
+  window->height = win_h;
+
+  std::vector<CefRefPtr<CefView>> z_order;
+
+  if (window->page_view_id > 0) {
+    if (auto page = FindView(window->page_view_id)) {
+      if (page->widget && !page->destroying) {
+        EnsureWindowChild(window->window, page->widget);
+        page->widget->SetInsets(CefInsets(0, 0, 0, 0));
+        page->widget->SetVisible(true);
+        page->widget->SetFocusable(true);
+        page->x = 0;
+        page->y = 0;
+        page->width = win_w;
+        page->height = win_h;
+        page->widget->SetBounds(CefRect(0, 0, win_w, win_h));
+        ApplyViewDecorations(page);
+        z_order.push_back(page->widget);
+      }
+    }
+  }
+
+  int bottom_cursor = win_h;
+  for (int i = static_cast<int>(window->bar_view_ids.size()) - 1; i >= 0; --i) {
+    auto bar = FindView(window->bar_view_ids[static_cast<size_t>(i)]);
+    if (!bar || !bar->widget || bar->destroying)
+      continue;
+    EnsureWindowChild(window->window, bar->widget);
+    bar->widget->SetFocusable(true);
+    bar->widget->SetInsets(CefInsets(0, 0, 0, 0));
+    if (bar->bar_height <= 0) {
+      bar->widget->SetVisible(false);
+      bar->x = 0;
+      bar->y = bottom_cursor;
+      bar->width = win_w;
+      bar->height = 0;
+    } else {
+      int slot_h = bar->bar_height;
+      int slot_y = bottom_cursor - slot_h;
+      bottom_cursor = slot_y;
+      bar->x = 0;
+      bar->y = slot_y;
+      bar->width = win_w;
+      bar->height = slot_h;
+      int bx = bar->inset_left;
+      int by = slot_y + bar->inset_top;
+      int bw = std::max(1, win_w - bar->inset_left - bar->inset_right);
+      int bh = std::max(1, slot_h - bar->inset_top - bar->inset_bottom);
+      bar->widget->SetVisible(true);
+      bar->widget->SetBounds(CefRect(bx, by, bw, bh));
+      ApplyViewDecorations(bar);
+    }
+  }
+
+  int panel_bottom = std::max(1, bottom_cursor);
+  int left_cursor = 0;
+  for (int panel_id : window->left_view_ids) {
+    auto panel = FindView(panel_id);
+    if (!panel || !panel->widget || panel->destroying)
+      continue;
+    if (panel->side_width <= 0) {
+      RemoveWindowChild(panel->widget);
+      panel->widget->SetVisible(false);
+      panel->width = 0;
+      continue;
+    }
+    EnsureWindowChild(window->window, panel->widget);
+    panel->widget->SetFocusable(true);
+    panel->widget->SetInsets(CefInsets(0, 0, 0, 0));
+    panel->x = left_cursor;
+    panel->y = 0;
+    panel->width = panel->side_width;
+    panel->height = panel_bottom;
+    int px = left_cursor + panel->inset_left;
+    int py = panel->inset_top;
+    int pw = std::max(1, panel->side_width - panel->inset_left - panel->inset_right);
+    int ph = std::max(1, panel_bottom - panel->inset_top - panel->inset_bottom);
+    panel->widget->SetVisible(true);
+    panel->widget->SetBounds(CefRect(px, py, pw, ph));
+    ApplyViewDecorations(panel);
+    z_order.push_back(panel->widget);
+    left_cursor += panel->side_width;
+  }
+
+  int right_cursor = win_w;
+  for (int panel_id : window->right_view_ids) {
+    auto panel = FindView(panel_id);
+    if (!panel || !panel->widget || panel->destroying)
+      continue;
+    if (panel->side_width <= 0) {
+      RemoveWindowChild(panel->widget);
+      panel->widget->SetVisible(false);
+      panel->width = 0;
+      continue;
+    }
+    int slot_x = right_cursor - panel->side_width;
+    right_cursor = slot_x;
+    EnsureWindowChild(window->window, panel->widget);
+    panel->widget->SetFocusable(true);
+    panel->widget->SetInsets(CefInsets(0, 0, 0, 0));
+    panel->x = slot_x;
+    panel->y = 0;
+    panel->width = panel->side_width;
+    panel->height = panel_bottom;
+    int px = slot_x + panel->inset_left;
+    int py = panel->inset_top;
+    int pw = std::max(1, panel->side_width - panel->inset_left - panel->inset_right);
+    int ph = std::max(1, panel_bottom - panel->inset_top - panel->inset_bottom);
+    panel->widget->SetVisible(true);
+    panel->widget->SetBounds(CefRect(px, py, pw, ph));
+    ApplyViewDecorations(panel);
+    z_order.push_back(panel->widget);
+  }
+
+#ifdef CL_CEF_HAS_VIEWPORT_CUTOUT
+  if (window->frame_enabled) {
+    if (!window->matte) {
+      window->matte = CefPanel::CreatePanel(nullptr);
+      window->matte->ClearLayout();
+    }
+    EnsureWindowChild(window->window, window->matte);
+    window->matte->SetFocusable(false);
+    window->matte->SetInsets(CefInsets(0, 0, 0, 0));
+    window->matte->SetBounds(CefRect(0, 0, win_w, win_h));
+    window->matte->SetVisible(true);
+    int cut_x = left_cursor > 0 ? left_cursor : window->frame_left;
+    int cut_y = window->frame_top;
+    int cut_right = right_cursor < win_w ? right_cursor : (win_w - window->frame_right);
+    int cut_bottom = bottom_cursor - window->frame_bottom;
+    int cut_w = std::max(1, cut_right - cut_x);
+    int cut_h = std::max(1, cut_bottom - cut_y);
+    window->matte->SetViewportCutout(
+        true, cut_x, cut_y, cut_w, cut_h,
+        window->frame_radius, window->frame_blur,
+        window->frame_tint_color, window->frame_border_color);
+    auto insert_pos = (!z_order.empty() && window->page_view_id > 0)
+                          ? (z_order.begin() + 1)
+                          : z_order.begin();
+    z_order.insert(insert_pos, window->matte);
+  } else if (window->matte) {
+    window->matte->SetViewportCutout(false, 0, 0, 0, 0, 0, 0, 0, 0);
+    window->matte->SetVisible(false);
+    RemoveWindowChild(window->matte);
+  }
+#endif
+
+  for (int bar_id : window->bar_view_ids) {
+    auto bar = FindView(bar_id);
+    if (bar && bar->widget && !bar->destroying) {
+      CefRefPtr<CefView> parent = bar->widget->GetParentView();
+      if (parent && parent->IsSame(window->window))
+        z_order.push_back(bar->widget);
+    }
+  }
+
+  for (int idx = 0; idx < static_cast<int>(z_order.size()); ++idx) {
+    if (idx < static_cast<int>(window->window->GetChildViewCount()) &&
+        !window->window->GetChildViewAt(idx)->IsSame(z_order[static_cast<size_t>(idx)])) {
+      window->window->ReorderChildView(z_order[static_cast<size_t>(idx)], idx);
+    }
+  }
+
+  window->laying_out = false;
+#else
+  (void)window;
+#endif
+}
+
+}
+}
+
+std::shared_ptr<WindowRecord> OwningWindow(const std::shared_ptr<ViewRecord>& record) {
+  if (!record)
+    return nullptr;
+  if (record->window_id > 0) {
+    if (auto win = FindWindow(record->window_id))
+      return win;
+  }
+  if (record->widget)
+    return FindWindowByWidget(record->widget->GetWindow());
+  return nullptr;
+}
+
 void PlaceContentView(const std::shared_ptr<WindowRecord>& window,
                       const std::shared_ptr<ViewRecord>& view) {
   if (!window || !window->window || !view || !view->widget)
     return;
+  view->window_id = window->id;
+#ifdef CL_CEF_HAS_CLEAR_LAYOUT
+  DetachFromWindowSlots(window, view->id);
+  if (view->content_slot == 1)
+    window->left_view_ids.push_back(view->id);
+  else if (view->content_slot == 2)
+    window->right_view_ids.push_back(view->id);
+  else
+    window->page_view_id = view->id;
+  LayoutWindowViews(window);
+  ApplyHostIdentity(window->window);
+#else
   EnsureContentRow(window);
   if (!window->content)
     return;
@@ -3395,11 +3715,9 @@ void PlaceContentView(const std::shared_ptr<WindowRecord>& window,
   view->widget->InvalidateLayout();
   window->content->Layout();
   window->window->Layout();
-#ifdef CL_CEF_HAS_CORNER_RADIUS
-  if (view->corner_radius > 0)
-    view->widget->SetCornerRadius(view->corner_radius);
-#endif
+  ApplyViewDecorations(view);
   ApplyHostIdentity(window->window);
+#endif
 }
 
 void PlaceView(const std::shared_ptr<WindowRecord>& window,
@@ -3407,6 +3725,22 @@ void PlaceView(const std::shared_ptr<WindowRecord>& window,
                int index) {
   if (!window || !window->window || !view || !view->widget)
     return;
+  view->window_id = window->id;
+#ifdef CL_CEF_HAS_CLEAR_LAYOUT
+  DetachFromWindowSlots(window, view->id);
+  if (view->bar) {
+    if (index >= 1 && index - 1 <= static_cast<int>(window->bar_view_ids.size())) {
+      window->bar_view_ids.insert(
+          window->bar_view_ids.begin() + (index - 1), view->id);
+    } else {
+      window->bar_view_ids.push_back(view->id);
+    }
+  } else {
+    window->page_view_id = view->id;
+  }
+  LayoutWindowViews(window);
+  ApplyHostIdentity(window->window);
+#else
   // Remove + Add on a view that is already parented registers its widget
   // observer a second time. Chromium then aborts the UI thread.
   CefRefPtr<CefView> parent = view->widget->GetParentView();
@@ -3431,12 +3765,10 @@ void PlaceView(const std::shared_ptr<WindowRecord>& window,
   }
   view->widget->SetFocusable(true);
   window->window->Layout();
-#ifdef CL_CEF_HAS_CORNER_RADIUS
-  if (view->corner_radius > 0)
-    view->widget->SetCornerRadius(view->corner_radius);
-#endif
+  ApplyViewDecorations(view);
   // Adding a browser view is when Chrome paints the product logo again.
   ApplyHostIdentity(window->window);
+#endif
 }
 
 void cl_cef_window_add_view(int window_id, int view_id) {
@@ -3452,15 +3784,20 @@ void cl_cef_window_add_view_at(int window_id, int view_id, int index) {
 }
 
 void cl_cef_window_remove_view(int window_id, int view_id) {
-  (void)window_id;
+  auto window = FindWindow(window_id);
   auto view = FindView(view_id);
-  CallUI([view]() {
+  CallUI([window, view, view_id]() {
+    if (window)
+      DetachFromWindowSlots(window, view_id);
     if (!view || !view->widget)
       return;
+    view->window_id = 0;
     if (CefRefPtr<CefView> parent = view->widget->GetParentView()) {
       if (auto panel = parent->AsPanel())
         panel->RemoveChildView(view->widget);
     }
+    if (window)
+      LayoutWindowViews(window);
   });
 }
 
@@ -3470,6 +3807,33 @@ void cl_cef_window_add_content_view(int window_id, int view_id, int side) {
   if (view)
     view->content_slot = side;
   CallUI([window, view]() { PlaceContentView(window, view); });
+}
+
+void cl_cef_window_set_viewport_frame(int window_id,
+                                      int enabled,
+                                      int top,
+                                      int left,
+                                      int bottom,
+                                      int right,
+                                      int corner_radius,
+                                      int blur_radius,
+                                      unsigned int tint_color,
+                                      unsigned int border_color) {
+  auto window = FindWindow(window_id);
+  if (!window)
+    return;
+  CallUI([window, enabled, top, left, bottom, right, corner_radius, blur_radius, tint_color, border_color]() {
+    window->frame_enabled = enabled != 0;
+    window->frame_top = std::max(0, top);
+    window->frame_left = std::max(0, left);
+    window->frame_bottom = std::max(0, bottom);
+    window->frame_right = std::max(0, right);
+    window->frame_radius = std::max(0, corner_radius);
+    window->frame_blur = std::max(0, blur_radius);
+    window->frame_tint_color = tint_color;
+    window->frame_border_color = border_color;
+    LayoutWindowViews(window);
+  });
 }
 
 void cl_cef_view_set_side_width(int id, int width, int side) {
@@ -3482,7 +3846,7 @@ void cl_cef_view_set_side_width(int id, int width, int side) {
   CallUI([record]() {
     if (!record->widget)
       return;
-    auto window = FindWindowByWidget(record->widget->GetWindow());
+    auto window = OwningWindow(record);
     if (window)
       PlaceContentView(window, record);
   });
@@ -3505,11 +3869,12 @@ void ViewContextHandler::OnRequestContextInitialized(CefRefPtr<CefRequestContext
     // fetch lisp: URLs, which only resolve where a factory is registered.
     RegisterSchemeFactories(context);
     CefBrowserSettings browser_settings;
-    ConfigureBrowserBackground(browser_settings, record_->background_color);
+    ConfigureBrowserBackground(browser_settings, record_->background_color, record_->transparent_background);
     record_->widget = CefBrowserView::CreateBrowserView(
         new Client(record_->id), url_, browser_settings, nullptr, context,
         new BrowserViewDelegate(style_, record_->id));
-    PaintViewBackground(record_->widget, record_->background_color);
+    PaintViewBackground(record_->widget, record_->background_color, record_->transparent_background);
+    ApplyViewDecorations(record_);
   }
   Finish();
 }
@@ -3548,12 +3913,13 @@ int cl_cef_view_create(const char* url, int alloy, int isolated, unsigned int ba
       CefRequestContextSettings context_settings;
       record->context = CefRequestContext::CreateContext(context_settings, nullptr);
       CefBrowserSettings browser_settings;
-      ConfigureBrowserBackground(browser_settings, record->background_color);
+      ConfigureBrowserBackground(browser_settings, record->background_color, record->transparent_background);
       record->widget = CefBrowserView::CreateBrowserView(
           new Client(record->id), initial, browser_settings, nullptr,
           record->isolated ? record->context : nullptr,
           new BrowserViewDelegate(style, record->id));
-      PaintViewBackground(record->widget, record->background_color);
+      PaintViewBackground(record->widget, record->background_color, record->transparent_background);
+      ApplyViewDecorations(record);
     });
   }
   if (!record->widget) {
@@ -3618,9 +3984,15 @@ void cl_cef_view_set_background_color(int id, unsigned int color) {
   auto record = FindView(id);
   if (!record)
     return;
-  record->background_color = ResolveBackground(color);
+  if (color == 0) {
+    record->transparent_background = true;
+    record->background_color = 0;
+  } else {
+    record->transparent_background = false;
+    record->background_color = ResolveBackground(color);
+  }
   CallUI([record]() {
-    PaintViewBackground(record->widget, record->background_color);
+    PaintViewBackground(record->widget, record->background_color, record->transparent_background);
   });
 }
 
@@ -3651,6 +4023,10 @@ void cl_cef_view_set_insets(int id, int top, int left, int bottom, int right) {
     record->inset_bottom = clamped_bottom;
     record->inset_right = clamped_right;
     record->insets_applied = true;
+#ifdef CL_CEF_HAS_CLEAR_LAYOUT
+    if (auto win = OwningWindow(record))
+      LayoutWindowViews(win);
+#else
     CefRect before = record->widget->GetBounds();
     record->widget->SetInsets(
         CefInsets(clamped_top, clamped_left, clamped_bottom, clamped_right));
@@ -3664,9 +4040,7 @@ void cl_cef_view_set_insets(int id, int top, int left, int bottom, int right) {
       record->widget->SetSize(CefSize(after.width, after.height + 1));
       record->widget->SetBounds(after);
     }
-#ifdef CL_CEF_HAS_CORNER_RADIUS
-    if (record->corner_radius > 0)
-      record->widget->SetCornerRadius(record->corner_radius);
+    ApplyViewDecorations(record);
 #endif
   });
 }
@@ -3688,6 +4062,50 @@ void cl_cef_view_set_corner_radius(int id, int radius) {
   });
 }
 
+void cl_cef_view_set_background_blur(int id, int radius) {
+  auto record = FindView(id);
+  if (!record)
+    return;
+  int blur = radius > 0 ? radius : 0;
+  CallUI([record, blur]() {
+    record->background_blur = blur;
+    if (!record->widget)
+      return;
+#ifdef CL_CEF_HAS_BACKGROUND_BLUR
+    record->widget->SetBackgroundBlur(blur);
+#else
+    (void)blur;
+#endif
+  });
+}
+
+void cl_cef_view_set_safe_area_insets(int id, int top, int left, int bottom, int right) {
+  auto record = FindView(id);
+  if (!record)
+    return;
+  int ct = top > 0 ? top : 0;
+  int cl = left > 0 ? left : 0;
+  int cb = bottom > 0 ? bottom : 0;
+  int cr = right > 0 ? right : 0;
+  CallUI([record, ct, cl, cb, cr]() {
+    record->safe_top = ct;
+    record->safe_left = cl;
+    record->safe_bottom = cb;
+    record->safe_right = cr;
+    record->safe_area_applied = true;
+    if (!record->widget)
+      return;
+#ifdef CL_CEF_HAS_SAFE_AREA_INSETS
+    record->widget->SetSafeAreaInsets(ct, cl, cb, cr);
+#else
+    (void)ct;
+    (void)cl;
+    (void)cb;
+    (void)cr;
+#endif
+  });
+}
+
 void cl_cef_view_set_bar_height(int id, int height) {
   auto record = FindView(id);
   if (!record)
@@ -3698,10 +4116,17 @@ void cl_cef_view_set_bar_height(int id, int height) {
   CallUI([record]() {
     if (!record->widget)
       return;
+#ifdef CL_CEF_HAS_CLEAR_LAYOUT
+    if (auto win = OwningWindow(record))
+      LayoutWindowViews(win);
+    else
+      record->widget->SetVisible(record->bar_height > 0);
+#else
     record->widget->SetVisible(record->bar_height > 0);
     record->widget->InvalidateLayout();
     if (auto window = record->widget->GetWindow())
       window->Layout();
+#endif
   });
 }
 

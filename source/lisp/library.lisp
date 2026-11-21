@@ -196,6 +196,18 @@
   (view-id :int)
   (side :int))
 
+(defcef "cl_cef_window_set_viewport_frame" :void
+  (window-id :int)
+  (enabled :int)
+  (top :int)
+  (left :int)
+  (bottom :int)
+  (right :int)
+  (corner-radius :int)
+  (blur-radius :int)
+  (tint-color :unsigned-int)
+  (border-color :unsigned-int))
+
 (defcef "cl_cef_set_background_color" :void
   (color :unsigned-int))
 
@@ -229,6 +241,17 @@
 (defcef "cl_cef_view_set_corner_radius" :void
   (id :int)
   (radius :int))
+
+(defcef "cl_cef_view_set_background_blur" :void
+  (id :int)
+  (radius :int))
+
+(defcef "cl_cef_view_set_safe_area_insets" :void
+  (id :int)
+  (top :int)
+  (left :int)
+  (bottom :int)
+  (right :int))
 
 (defcef "cl_cef_view_set_side_width" :void
   (id :int)
