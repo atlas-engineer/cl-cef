@@ -171,6 +171,24 @@ class DevToolsObserver : public CefDevToolsMessageObserver {
     waiters_.erase(id);
   }
 
+  void CancelAll() {
+    std::unordered_map<int, std::shared_ptr<JsWaiter>> pending;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      pending.swap(waiters_);
+    }
+    for (auto& pair : pending) {
+      if (pair.second) {
+        {
+          std::lock_guard<std::mutex> lock(pair.second->mu);
+          pair.second->done = true;
+          pair.second->success = false;
+        }
+        pair.second->cv.notify_all();
+      }
+    }
+  }
+
   void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,
                               int message_id,
                               bool success,
@@ -563,6 +581,8 @@ void DropView(const std::shared_ptr<ViewRecord>& record) {
   }
   record->pending.clear();
   record->browser = nullptr;
+  if (record->devtools_observer)
+    record->devtools_observer->CancelAll();
   record->devtools_registration = nullptr;
   record->devtools_observer = nullptr;
   record->widget = nullptr;
@@ -3705,7 +3725,7 @@ std::shared_ptr<WindowRecord> OwningWindow(const std::shared_ptr<ViewRecord>& re
 
 void PlaceContentView(const std::shared_ptr<WindowRecord>& window,
                       const std::shared_ptr<ViewRecord>& view) {
-  if (!window || !window->window || !view || !view->widget)
+  if (!window || !window->window || !view || !view->widget || view->destroying)
     return;
   view->window_id = window->id;
 #ifdef CL_CEF_HAS_CLEAR_LAYOUT
@@ -3763,7 +3783,7 @@ void PlaceContentView(const std::shared_ptr<WindowRecord>& window,
 void PlaceView(const std::shared_ptr<WindowRecord>& window,
                const std::shared_ptr<ViewRecord>& view,
                int index) {
-  if (!window || !window->window || !view || !view->widget)
+  if (!window || !window->window || !view || !view->widget || view->destroying)
     return;
   view->window_id = window->id;
 #ifdef CL_CEF_HAS_CLEAR_LAYOUT
@@ -3984,6 +4004,12 @@ void cl_cef_view_destroy(int id) {
       return;
     record->destroying = true;
     record->pending.clear();
+    if (record->devtools_observer)
+      record->devtools_observer->CancelAll();
+    auto owning_window = OwningWindow(record);
+    if (owning_window)
+      DetachFromWindowSlots(owning_window, record->id);
+    record->window_id = 0;
     CefRefPtr<CefBrowser> browser = record->browser;
     if (!browser && record->widget)
       browser = record->widget->GetBrowser();
@@ -3993,6 +4019,8 @@ void cl_cef_view_destroy(int id) {
           panel->RemoveChildView(record->widget);
       }
     }
+    if (owning_window)
+      LayoutWindowViews(owning_window);
     if (browser) {
       record->browser = browser;
       record->close_started = true;
@@ -4406,20 +4434,22 @@ char* cl_cef_view_execute_javascript_sync(int id, const char* code, int* success
   if (!record)
     return nullptr;
   auto waiter = std::make_shared<JsWaiter>();
+  CefRefPtr<DevToolsObserver> observer;
   int message_id = CallUI([&]() {
-    if (!record->browser)
+    if (record->destroying || !record->browser)
       return 0;
     CefRefPtr<CefBrowserHost> host = record->browser->GetHost();
     if (!record->devtools_observer) {
       record->devtools_observer = new DevToolsObserver();
       record->devtools_registration = host->AddDevToolsMessageObserver(record->devtools_observer);
     }
+    observer = record->devtools_observer;
     CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
     params->SetString("expression", code ? code : "");
     params->SetBool("returnByValue", true);
     params->SetBool("awaitPromise", true);
     int assigned = ++record->devtools_message_id;
-    record->devtools_observer->Expect(assigned, waiter);
+    observer->Expect(assigned, waiter);
     host->ExecuteDevToolsMethod(assigned, "Runtime.evaluate", params);
     return assigned;
   });
@@ -4430,8 +4460,8 @@ char* cl_cef_view_execute_javascript_sync(int id, const char* code, int* success
     std::unique_lock<std::mutex> lock(waiter->mu);
     completed = waiter->cv.wait_for(lock, std::chrono::seconds(30), [&]() { return waiter->done; });
   }
-  if (!completed && record->devtools_observer)
-    record->devtools_observer->Cancel(message_id);
+  if (!completed && observer)
+    observer->Cancel(message_id);
   if (success)
     *success = waiter->success ? 1 : 0;
   return waiter->success ? Dup(waiter->json) : nullptr;
