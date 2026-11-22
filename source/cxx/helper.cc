@@ -14,6 +14,7 @@
 #include "include/cef_render_process_handler.h"
 #include "include/wrapper/cef_message_router.h"
 
+#include <cstdio>
 #include <cstdlib>
 
 #if defined(__linux__)
@@ -112,21 +113,32 @@ class HelperApp : public CefApp, public CefRenderProcessHandler {
 
 }  // namespace
 
+#if defined(__clang__)
+__attribute__((no_stack_protector))
+#elif defined(__GNUC__)
+__attribute__((optimize("no-stack-protector")))
+#endif
 int main(int argc, char* argv[]) {
 #if defined(__linux__)
   /* The zygote leaves Nyxt's process group, so the signal that kills Nyxt is
    * not delivered here. SIGKILL cannot be caught: Chromium handles SIGTERM and
    * would keep running after the parent died. */
   if (prctl(PR_SET_PDEATHSIG, SIGKILL) == 0 && getppid() == 1)
-    return 0;
+    _exit(0);
 #endif
   cl_cef_note_schemes_from_argv(argc, argv);
   cl_cef_note_schemes_from_user_data(argc, argv);
   CefMainArgs main_args(argc, argv);
   CefRefPtr<HelperApp> app = new HelperApp();
   int code = CefExecuteProcess(main_args, app, nullptr);
+  app = nullptr;
+#if defined(__linux__)
+  std::fflush(nullptr);
+  _exit(code >= 0 ? code : 1);
+#else
   if (code >= 0)
     return code;
   /* Launched as a browser process by mistake. */
   return 1;
+#endif
 }

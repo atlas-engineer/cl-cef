@@ -216,6 +216,11 @@ class DevToolsObserver : public CefDevToolsMessageObserver {
     waiter->cv.notify_one();
   }
 
+  void OnDevToolsAgentDetached(CefRefPtr<CefBrowser> browser) override {
+    (void)browser;
+    CancelAll();
+  }
+
  private:
   static bool Decode(const void* result, size_t result_size, std::string& json) {
     if (!result || result_size == 0)
@@ -2336,6 +2341,19 @@ class Client : public CefClient,
     (void)request_initiator;
     (void)disable_default_handling;
     return this;
+  }
+
+  void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser,
+                                 TerminationStatus status,
+                                 int error_code,
+                                 const CefString& error_string) override {
+    (void)browser;
+    (void)status;
+    (void)error_code;
+    (void)error_string;
+    auto record = FindView(view_id_);
+    if (record && record->devtools_observer)
+      record->devtools_observer->CancelAll();
   }
 
   CefResourceRequestHandler::ReturnValue OnBeforeResourceLoad(
