@@ -68,6 +68,7 @@
 #undef Success
 #endif
 #if defined(OS_MAC) || defined(__APPLE__)
+#include <CoreGraphics/CGGeometry.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #endif
@@ -2592,6 +2593,38 @@ void ApplyViewDecorations(const std::shared_ptr<ViewRecord>& record) {
 #endif
 }
 
+CefSize WindowContentSize(CefRefPtr<CefWindow> window, int fallback_w, int fallback_h) {
+  int w = fallback_w;
+  int h = fallback_h;
+  if (window) {
+#if defined(OS_MAC) || defined(__APPLE__)
+    id view = reinterpret_cast<id>(window->GetWindowHandle());
+    if (view) {
+      SEL sel = sel_registerName("bounds");
+      CGRect bounds = CGRectZero;
+#if defined(__aarch64__)
+      using SendRect = CGRect (*)(id, SEL);
+      bounds = reinterpret_cast<SendRect>(objc_msgSend)(view, sel);
+#elif defined(__x86_64__)
+      using SendRectStret = void (*)(CGRect*, id, SEL);
+      reinterpret_cast<SendRectStret>(objc_msgSend_stret)(&bounds, view, sel);
+#endif
+      if (bounds.size.width > 0 && bounds.size.height > 0) {
+        w = static_cast<int>(std::lround(bounds.size.width));
+        h = static_cast<int>(std::lround(bounds.size.height));
+      }
+    }
+#else
+    CefRect client = window->GetBounds();
+    if (client.width > 0)
+      w = client.width;
+    if (client.height > 0)
+      h = client.height;
+#endif
+  }
+  return CefSize(std::max(1, w), std::max(1, h));
+}
+
 void LayoutWindowViews(const std::shared_ptr<WindowRecord>& window);
 
 void PaintWindowBackground(CefRefPtr<CefWindow> window) {
@@ -2751,9 +2784,9 @@ class WindowDelegate : public CefWindowDelegate {
     // SetBounds from a resize listener calls back into this method. A nested
     // emit runs that listener again and overflows the UI thread.
     if (auto record = FindWindow(id_)) {
-      CefRect client = record->window ? record->window->GetBounds() : CefRect();
-      record->width = client.width > 0 ? client.width : new_bounds.width;
-      record->height = client.height > 0 ? client.height : new_bounds.height;
+      CefSize content = WindowContentSize(record->window, new_bounds.width, new_bounds.height);
+      record->width = content.width;
+      record->height = content.height;
       LayoutWindowViews(record);
     }
     if (emitting_bounds_)
@@ -2765,6 +2798,17 @@ class WindowDelegate : public CefWindowDelegate {
              ",\"width\":" + std::to_string(new_bounds.width) +
              ",\"height\":" + std::to_string(new_bounds.height) + "}");
     emitting_bounds_ = false;
+  }
+
+  void OnWindowFullscreenTransition(CefRefPtr<CefWindow> window, bool is_completed) override {
+    (void)window;
+    (void)is_completed;
+    if (auto record = FindWindow(id_)) {
+      CefSize content = WindowContentSize(record->window, record->width, record->height);
+      record->width = content.width;
+      record->height = content.height;
+      LayoutWindowViews(record);
+    }
   }
 
   bool CanClose(CefRefPtr<CefWindow> window) override {
@@ -3266,6 +3310,9 @@ int cl_cef_window_create(int width, int height, const char* title) {
 #endif
       record->window->SetTitle(record->title);
       record->window->Show();
+      CefSize content = WindowContentSize(record->window, record->width, record->height);
+      record->width = content.width;
+      record->height = content.height;
       ApplyHostIdentity(record->window);
     }
   });
@@ -3528,11 +3575,9 @@ void LayoutWindowViews(const std::shared_ptr<WindowRecord>& window) {
   if (!window || !window->window || window->laying_out)
     return;
   window->laying_out = true;
-  CefRect client = window->window->GetBounds();
-  int win_w = client.width > 0 ? client.width : window->width;
-  int win_h = client.height > 0 ? client.height : window->height;
-  win_w = std::max(1, win_w);
-  win_h = std::max(1, win_h);
+  CefSize content = WindowContentSize(window->window, window->width, window->height);
+  int win_w = content.width;
+  int win_h = content.height;
   window->width = win_w;
   window->height = win_h;
 
@@ -4216,6 +4261,12 @@ void cl_cef_view_set_bounds(int id, int x, int y, int width, int height) {
       return;
     if (record->bar)
       record->widget->SetVisible(height > 0);
+#ifdef CL_CEF_HAS_CLEAR_LAYOUT
+    if (auto owning = OwningWindow(record)) {
+      LayoutWindowViews(owning);
+      return;
+    }
+#endif
     if (auto window = record->widget->GetWindow()) {
       if (window->GetLayout()) {
         record->widget->InvalidateLayout();
