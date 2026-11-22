@@ -69,8 +69,10 @@
 #endif
 #if defined(OS_MAC) || defined(__APPLE__)
 #include <CoreGraphics/CGGeometry.h>
+#include <libproc.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <sys/proc_info.h>
 #endif
 
 struct cl_cef_response {
@@ -931,10 +933,12 @@ class ViewContextHandler : public CefRequestContextHandler {
 };
 
 void FocusView(const std::shared_ptr<ViewRecord>& record) {
-  if (!record || !record->widget)
+  if (!record || !record->widget || record->destroying)
     return;
   CefRefPtr<CefWindow> window = record->widget->GetWindow();
-  if (window && !window->IsActive())
+  if (!window)
+    return;
+  if (!window->IsActive())
     window->Activate();
   record->widget->SetFocusable(true);
   record->widget->RequestFocus();
@@ -2539,6 +2543,16 @@ class Client : public CefClient,
     return true;
   }
 
+  bool OnSetFocus(CefRefPtr<CefBrowser> browser, FocusSource source) override {
+    (void)browser;
+    auto view = FindView(view_id_);
+    if (!view || view->destroying || !view->widget || !view->widget->GetWindow())
+      return true;
+    if (source == FOCUS_SOURCE_NAVIGATION && view->bar)
+      return true;
+    return false;
+  }
+
   void OnTakeFocus(CefRefPtr<CefBrowser> browser, bool next) override {
     (void)browser;
     (void)next;
@@ -2896,6 +2910,36 @@ void ReapHelpers() {
   for (int pass = 0; pass < 4; ++pass) {
     std::unordered_map<pid_t, std::vector<pid_t>> children;
     std::vector<pid_t> helpers;
+#if defined(__APPLE__)
+    int byte_count = proc_listpids(PROC_ALL_PIDS, 0, nullptr, 0);
+    if (byte_count <= 0)
+      return;
+    std::vector<pid_t> pids(static_cast<size_t>(byte_count) / sizeof(pid_t) + 64, 0);
+    int filled = proc_listpids(
+        PROC_ALL_PIDS, 0, pids.data(), static_cast<int>(pids.size() * sizeof(pid_t)));
+    if (filled <= 0)
+      return;
+    size_t pid_count = static_cast<size_t>(filled) / sizeof(pid_t);
+    for (size_t i = 0; i < pid_count; ++i) {
+      pid_t pid = pids[i];
+      if (pid <= 0 || pid == self)
+        continue;
+      struct proc_bsdinfo info;
+      if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof info) ==
+          static_cast<int>(sizeof info)) {
+        pid_t parent = static_cast<pid_t>(info.pbi_ppid);
+        if (parent > 0)
+          children[parent].push_back(pid);
+      }
+      char path[PROC_PIDPATHINFO_MAXSIZE];
+      if (proc_pidpath(pid, path, sizeof path) > 0) {
+        if (std::strstr(path, "cl-cef-helper") != nullptr ||
+            std::strstr(path, " Helper") != nullptr) {
+          helpers.push_back(pid);
+        }
+      }
+    }
+#else
     DIR* proc = opendir("/proc");
     if (!proc)
       return;
@@ -2945,6 +2989,7 @@ void ReapHelpers() {
         helpers.push_back(pid);
     }
     closedir(proc);
+#endif
     std::vector<pid_t> pending{self};
     std::vector<pid_t> victims;
     for (size_t index = 0; index < pending.size(); ++index) {
@@ -3123,6 +3168,121 @@ void cl_cef_request_stop(void) {
 void cl_cef_adblock_reset_cosmetic(void) { ResetCosmetic(); }
 
 #if defined(OS_MAC) || defined(__APPLE__)
+#if defined(__OBJC_BOOL_IS_BOOL) && __OBJC_BOOL_IS_BOOL
+constexpr const char* kObjcBoolGetterTypes = "B@:";
+constexpr const char* kObjcBoolSetterTypes = "v@:B";
+constexpr const char* kObjcBoolAppArgTypes = "B@:@";
+#else
+constexpr const char* kObjcBoolGetterTypes = "c@:";
+constexpr const char* kObjcBoolSetterTypes = "v@:c";
+constexpr const char* kObjcBoolAppArgTypes = "c@:@";
+#endif
+
+thread_local BOOL g_handling_send_event = NO;
+IMP g_original_send_event = nullptr;
+
+BOOL ClCefIsHandlingSendEvent(id, SEL) { return g_handling_send_event; }
+
+void ClCefSetHandlingSendEvent(id, SEL, BOOL handling) {
+  g_handling_send_event = handling;
+}
+
+void ClCefSendEvent(id self, SEL cmd, id event) {
+  struct ScopedHandlingSendEvent {
+    BOOL previous;
+    ScopedHandlingSendEvent() : previous(g_handling_send_event) {
+      g_handling_send_event = YES;
+    }
+    ~ScopedHandlingSendEvent() { g_handling_send_event = previous; }
+  } scope;
+  if (g_original_send_event) {
+    reinterpret_cast<void (*)(id, SEL, id)>(g_original_send_event)(self, cmd, event);
+  }
+}
+
+void ClCefTerminate(id, SEL, id) { ::kill(::getpid(), SIGTERM); }
+
+BOOL ClCefSupportsSecureRestorableState(id, SEL, id) { return YES; }
+
+Protocol* EnsureObjcProtocol(const char* name, Protocol* parent) {
+  if (Protocol* existing = objc_getProtocol(name))
+    return existing;
+  Protocol* created = objc_allocateProtocol(name);
+  if (!created)
+    return nullptr;
+  if (parent)
+    protocol_addProtocol(created, parent);
+  objc_registerProtocol(created);
+  return created;
+}
+
+void InstallCrAppProtocol(Class ns_application) {
+  static std::once_flag installed;
+  std::call_once(installed, [ns_application]() {
+    Protocol* cr_app = EnsureObjcProtocol("CrAppProtocol", nullptr);
+    Protocol* cr_ctrl = EnsureObjcProtocol("CrAppControlProtocol", cr_app);
+    Protocol* cef_app = EnsureObjcProtocol("CefAppProtocol", cr_ctrl);
+    if (cr_app)
+      class_addProtocol(ns_application, cr_app);
+    if (cr_ctrl)
+      class_addProtocol(ns_application, cr_ctrl);
+    if (cef_app)
+      class_addProtocol(ns_application, cef_app);
+    class_addMethod(ns_application,
+                    sel_registerName("isHandlingSendEvent"),
+                    reinterpret_cast<IMP>(&ClCefIsHandlingSendEvent),
+                    kObjcBoolGetterTypes);
+    class_addMethod(ns_application,
+                    sel_registerName("setHandlingSendEvent:"),
+                    reinterpret_cast<IMP>(&ClCefSetHandlingSendEvent),
+                    kObjcBoolSetterTypes);
+    if (Method send_event =
+            class_getInstanceMethod(ns_application, sel_registerName("sendEvent:"))) {
+      g_original_send_event = method_setImplementation(
+          send_event, reinterpret_cast<IMP>(&ClCefSendEvent));
+    }
+    if (Method terminate =
+            class_getInstanceMethod(ns_application, sel_registerName("terminate:"))) {
+      method_setImplementation(terminate, reinterpret_cast<IMP>(&ClCefTerminate));
+    } else {
+      class_addMethod(ns_application,
+                      sel_registerName("terminate:"),
+                      reinterpret_cast<IMP>(&ClCefTerminate),
+                      "v@:@");
+    }
+  });
+}
+
+void EnsureNSApplicationDelegate(id app) {
+  using SendId = id (*)(id, SEL);
+  using SendClass = id (*)(Class, SEL);
+  using SendSet = void (*)(id, SEL, id);
+  if (reinterpret_cast<SendId>(objc_msgSend)(app, sel_registerName("delegate")))
+    return;
+  Class delegate_class = objc_getClass("ClCefAppDelegate");
+  if (!delegate_class) {
+    Class ns_object = objc_getClass("NSObject");
+    if (!ns_object)
+      return;
+    delegate_class = objc_allocateClassPair(ns_object, "ClCefAppDelegate", 0);
+    if (!delegate_class)
+      return;
+    class_addMethod(delegate_class,
+                    sel_registerName("applicationSupportsSecureRestorableState:"),
+                    reinterpret_cast<IMP>(&ClCefSupportsSecureRestorableState),
+                    kObjcBoolAppArgTypes);
+    objc_registerClassPair(delegate_class);
+  }
+  id alloc_obj =
+      reinterpret_cast<SendClass>(objc_msgSend)(delegate_class, sel_registerName("alloc"));
+  if (!alloc_obj)
+    return;
+  id delegate = reinterpret_cast<SendId>(objc_msgSend)(alloc_obj, sel_registerName("init"));
+  if (!delegate)
+    return;
+  reinterpret_cast<SendSet>(objc_msgSend)(app, sel_registerName("setDelegate:"), delegate);
+}
+
 // AppKit refuses NSWindow off the process main thread. CEF Views creates
 // NSWindows, so CefInitialize / CefRunMessageLoop must run there. Create the
 // shared application object before Chromium touches AppKit.
@@ -3130,12 +3290,14 @@ void EnsureNSApplication() {
   Class ns_application = objc_getClass("NSApplication");
   if (!ns_application)
     return;
+  InstallCrAppProtocol(ns_application);
   using SendClass = id (*)(Class, SEL);
   using SendIdInt = id (*)(id, SEL, long);
   id app = reinterpret_cast<SendClass>(objc_msgSend)(
       ns_application, sel_registerName("sharedApplication"));
   if (!app)
     return;
+  EnsureNSApplicationDelegate(app);
   // NSApplicationActivationPolicyRegular = 0
   reinterpret_cast<SendIdInt>(objc_msgSend)(
       app, sel_registerName("setActivationPolicy:"), 0);
