@@ -2035,14 +2035,19 @@ class Client : public CefClient,
     if (view->widget && view->corner_radius > 0)
       view->widget->SetCornerRadius(view->corner_radius);
 #endif
-    // Delete can win the race against creation. Close now that a browser
-    // exists; DropView runs from OnBrowserDestroyed.
+    // Delete can win the race against creation. Release the view once this
+    // callback has returned. CloseBrowser does not finish while the window
+    // refuses CanClose, so the renderer process would keep running.
     if (view->destroying) {
       view->pending.clear();
       if (!view->close_started) {
-        view->close_started = true;
-        browser->GetHost()->SetAudioMuted(true);
-        browser->GetHost()->CloseBrowser(true);
+        auto held = view;
+        CefPostTask(TID_UI, new ClosureTask([held]() {
+                      held->close_started = true;
+                      held->browser = nullptr;
+                      held->widget = nullptr;
+                      DropView(held);
+                    }));
       }
       return;
     }
@@ -2098,8 +2103,6 @@ class Client : public CefClient,
     auto view = FindView(view_id_);
     if (!BrowserBelongsToView(view, browser))
       return false;
-    // A missing view was already removed from the window. Returning false
-    // would close that window and every other view it still holds.
     return !view || view->destroying;
   }
 
@@ -4247,27 +4250,27 @@ void cl_cef_view_destroy(int id) {
     if (owning_window)
       LayoutWindowViews(owning_window);
     if (browser) {
-      record->browser = browser;
       record->close_started = true;
-      browser->GetHost()->SetAudioMuted(true);
-      browser->GetHost()->CloseBrowser(true);
+      record->browser = nullptr;
+      record->widget = nullptr;
+      DropView(record);
       return;
     }
-    // Creation has not reported a browser yet. Give OnAfterCreated one turn,
-    // then drop the view if none appeared.
+    // Creation has not reported a browser yet. OnAfterCreated releases it.
     CefPostTask(TID_UI, new ClosureTask([record]() {
                   if (record->close_started)
                     return;
                   CefRefPtr<CefBrowser> late = record->browser;
                   if (!late && record->widget)
                     late = record->widget->GetBrowser();
-                  if (late) {
-                    record->browser = late;
-                    record->close_started = true;
-                    late->GetHost()->SetAudioMuted(true);
-                    late->GetHost()->CloseBrowser(true);
+                  if (!late) {
+                    if (!record->widget)
+                      DropView(record);
                     return;
                   }
+                  record->close_started = true;
+                  record->browser = nullptr;
+                  record->widget = nullptr;
                   DropView(record);
                 }));
   });
